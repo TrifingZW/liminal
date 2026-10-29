@@ -348,7 +348,7 @@ mod tests {
     use super::compile;
     use crate::topology::VehicleTopology;
     use crate::types::{PortDescriptor, PortDirection, PortDomain};
-    use crate::unit::VehicleUnit;
+    use crate::units::VehicleUnit;
     use smallvec::{SmallVec, smallvec};
 
     struct Shaft;

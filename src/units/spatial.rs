@@ -5,7 +5,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::payload::PortPayload;
 use crate::spatial::SpatialJointDesc;
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::unit::{UnitContext, VehicleUnit};
+use crate::units::{UnitContext, VehicleUnit};
 
 /// 底盘：空间运动学树的根，提供多个挂载点。
 #[derive(Debug, Clone, Copy)]

@@ -4,7 +4,7 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::payload::PortPayload;
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::unit::{RotationalCoupling, UnitContext, VehicleUnit};
+use crate::units::{RotationalCoupling, UnitContext, VehicleUnit};
 
 /// 变速箱：挡位信号选择传动比，空挡断开内部耦合。
 ///

@@ -5,7 +5,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::payload::PortPayload;
 use crate::spatial::SpatialJointDesc;
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::unit::{UnitContext, VehicleUnit};
+use crate::units::{UnitContext, VehicleUnit};
 
 /// 发动机：油门信号输入，单旋转轴输出。
 #[derive(Debug, Clone, Copy)]

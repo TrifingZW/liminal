@@ -8,7 +8,7 @@ use crate::compiler::{CompiledVehicle, DrivetrainIsland};
 use crate::payload::{PortPayload, PortPayloads};
 use crate::topology::VehicleTopology;
 use crate::types::{PortDomain, PortId};
-use crate::unit::{RotationalCoupling, UnitContext};
+use crate::units::{RotationalCoupling, UnitContext};
 
 type RotationGraph = HashMap<PortId, SmallVec<[(PortId, f32); 4]>>;
 
@@ -191,7 +191,7 @@ mod tests {
     use crate::payload::{PortPayload, PortPayloads};
     use crate::topology::VehicleTopology;
     use crate::types::{PortDescriptor, PortDirection, PortDomain};
-    use crate::unit::{UnitContext, VehicleUnit};
+    use crate::units::{UnitContext, VehicleUnit};
     use smallvec::{SmallVec, smallvec};
 
     struct Rotor {

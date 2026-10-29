@@ -1,4 +1,9 @@
-//! 单元（Unit）：拓扑图中可组合的零部件行为抽象。
+//! 单元（Unit）：零部件行为抽象与具体实现。
+
+pub mod rotational;
+pub mod signal;
+pub mod spatial;
+pub mod transmission;
 
 use smallvec::SmallVec;
 

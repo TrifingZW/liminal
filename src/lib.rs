@@ -8,5 +8,4 @@ pub mod spatial;
 pub mod tire;
 pub mod topology;
 pub mod types;
-pub mod unit;
 pub mod units;

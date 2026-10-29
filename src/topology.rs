@@ -6,7 +6,7 @@ use slotmap::SlotMap;
 use smallvec::SmallVec;
 
 use crate::types::{ConnectError, Edge, EdgeId, NodeId, Port, PortDirection, PortId};
-use crate::unit::{Node, VehicleUnit};
+use crate::units::{Node, VehicleUnit};
 
 /// 多域端口图容器，持有节点、端口与边。
 #[derive(Default)]

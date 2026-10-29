@@ -3,7 +3,7 @@
 use smallvec::{SmallVec, smallvec};
 
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::unit::VehicleUnit;
+use crate::units::VehicleUnit;
 
 /// 驾驶员输入单元：输出油门、转向、挡位与制动四路标量信号。
 #[derive(Debug, Default, Clone, Copy)]
@@ -102,7 +102,7 @@ mod tests {
     use crate::payload::{PortPayload, PortPayloads};
     use crate::topology::VehicleTopology;
     use crate::types::{PortDescriptor, PortDirection, PortDomain};
-    use crate::unit::VehicleUnit;
+    use crate::units::VehicleUnit;
     use smallvec::{SmallVec, smallvec};
 
     #[test]
