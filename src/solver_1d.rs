@@ -8,7 +8,7 @@ use crate::compiler::{CompiledVehicle, DrivetrainIsland};
 use crate::payload::{PortPayload, PortPayloads};
 use crate::topology::VehicleTopology;
 use crate::types::{PortDomain, PortId};
-use crate::units::{RotationalCoupling, UnitContext};
+use crate::units::{RotationalCoupling, TorqueKind, UnitContext};
 
 type RotationGraph = HashMap<PortId, SmallVec<[(PortId, f32); 4]>>;
 
@@ -18,6 +18,11 @@ type RotationGraph = HashMap<PortId, SmallVec<[(PortId, f32); 4]>>;
 /// 单元内部按 `RotationalCoupling` 提供传动比或断开（空挡、滑摩）。
 /// 每个旋转连通组折算到参考轴：J_eq = ΣJ·r²，τ_eq = Στ·r，
 /// ω_ref += (τ_eq / J_eq)·dt，再按 ω_port = r·ω_ref 回写。
+///
+/// 扭矩分驱动与阻性两类：驱动扭矩直接积分；阻性扭矩（摩擦、制动）破钳制到
+/// “本步内恰好停转”的上限，避免符号翻转类阻力矩在显式积分下的静止震荡。
+/// 端口载荷中的 `torque` 字段作为外部注入扭矩（轮胎反作用力矩等）参与驱动侧，
+/// 消费后清零；断开端口的残留注入不会生效。
 pub fn step(
     topology: &VehicleTopology,
     compiled: &CompiledVehicle,
@@ -116,23 +121,43 @@ fn solve_island(
             }
         }
 
-        let mut total_torque = 0.0;
+        let mut drive_torque = 0.0;
+        let mut resist_torque = 0.0;
         let mut total_inertia = 0.0;
         for &node_id in island.nodes() {
             let Some(node) = topology.nodes().get(node_id) else {
                 continue;
             };
             let context = UnitContext::new(&node.ports, payloads);
-            if let Some(anchor) = first_rotational_port(topology, &node.ports) {
-                if let Some(&ratio) = ratios.get(&anchor) {
-                    total_inertia += node.unit.rotational_inertia() * ratio * ratio;
-                }
+
+            // 惯量按节点在本连通组内的首个旋转端口计提，
+            // 避免空挡变速箱/分离离合器把另一侧组件的惯量算漏。
+            let anchor = node
+                .ports
+                .iter()
+                .copied()
+                .find(|&port| ratios.contains_key(&port) && is_rotational(topology, port));
+            if let Some(&ratio) = anchor.and_then(|port| ratios.get(&port)) {
+                total_inertia += node.unit.rotational_inertia() * ratio * ratio;
             }
+
             for (index, &port) in node.ports.iter().enumerate() {
                 let Some(&ratio) = ratios.get(&port) else {
                     continue;
                 };
-                total_torque += node.unit.port_torque(&context, index) * ratio;
+                let torque = node.unit.port_torque(&context, index) * ratio;
+                match node.unit.port_torque_kind(&context, index) {
+                    TorqueKind::Drive => drive_torque += torque,
+                    TorqueKind::Resist => resist_torque += torque,
+                }
+                // 外部注入扭矩（轮胎反作用力矩等）：作为驱动类参与。
+                if let Some(PortPayload::Rotational {
+                    torque,
+                    ..
+                }) = payloads.read(port)
+                {
+                    drive_torque += torque * ratio;
+                }
             }
         }
 
@@ -147,23 +172,29 @@ fn solve_island(
             }) => angular_velocity,
             _ => 0.0,
         };
-        let next_reference = reference_velocity + total_torque / total_inertia * dt;
+
+        // 阻性合力钳制：本步内不得使参考轴转速反向穿越零点。
+        // 上限为归零所需扭矩与驱动合力幅值之和，允许制动恰好抵消驱动并停转。
+        let resist_limit = reference_velocity.abs() * total_inertia / dt + drive_torque.abs();
+        let resist_torque = resist_torque.clamp(-resist_limit, resist_limit);
+        let next_reference =
+            reference_velocity + (drive_torque + resist_torque) / total_inertia * dt;
 
         for &port in &component {
             updates.push((port, ratios[&port] * next_reference));
         }
     }
 
+    // 外部注入扭矩随本步消费立即清零，避免跨步重复施加。
     for (port, angular_velocity) in updates {
         if let Some(PortPayload::Rotational {
-            torque,
             ..
         }) = payloads.read(port)
         {
             payloads.write(
                 port,
                 PortPayload::Rotational {
-                    torque,
+                    torque: 0.0,
                     angular_velocity,
                 },
             );
@@ -191,6 +222,7 @@ mod tests {
     use crate::payload::{PortPayload, PortPayloads};
     use crate::topology::VehicleTopology;
     use crate::types::{PortDescriptor, PortDirection, PortDomain};
+    use crate::units::transmission::Brake;
     use crate::units::{UnitContext, VehicleUnit};
     use smallvec::{SmallVec, smallvec};
 
@@ -279,5 +311,87 @@ mod tests {
         };
         assert!((angular_velocity(spinning_port) - 0.05).abs() < 1e-6);
         assert_eq!(angular_velocity(idle_port), 0.0);
+    }
+
+    #[test]
+    fn resist_torque_stops_shaft_without_overshoot() {
+        let mut topology = VehicleTopology::new();
+        let rotor = topology.add_node(Rotor {
+            inertia: 1.0,
+            torque: 0.0,
+        });
+        let brake = topology.add_node(Brake::new(1_000.0));
+        let rotor_port = topology.nodes()[rotor].ports[0];
+        let brake_ports = topology.nodes()[brake].ports.clone();
+
+        topology.connect(rotor_port, brake_ports[Brake::SHAFT_PORT]).unwrap();
+
+        let mut payloads = PortPayloads::new();
+        payloads.rebuild(&topology);
+        payloads.write(
+            rotor_port,
+            PortPayload::Rotational {
+                torque: 0.0,
+                angular_velocity: 5.0,
+            },
+        );
+        payloads.write(brake_ports[Brake::BRAKE_PORT], PortPayload::Signal(1.0));
+
+        let compiled = compile(&topology).unwrap();
+        for _ in 0..10 {
+            step(&topology, &compiled, &mut payloads, 0.01);
+        }
+
+        let Some(PortPayload::Rotational {
+            angular_velocity,
+            ..
+        }) = payloads.read(rotor_port)
+        else {
+            panic!("端口应持有旋转载荷");
+        };
+        assert!(angular_velocity.abs() < 1e-6);
+    }
+
+    #[test]
+    fn injected_external_torque_is_consumed_once() {
+        let mut topology = VehicleTopology::new();
+        let rotor = topology.add_node(Rotor {
+            inertia: 2.0,
+            torque: 0.0,
+        });
+        let rotor_port = topology.nodes()[rotor].ports[0];
+
+        let mut payloads = PortPayloads::new();
+        payloads.rebuild(&topology);
+        payloads.write(
+            rotor_port,
+            PortPayload::Rotational {
+                torque: 4.0,
+                angular_velocity: 0.0,
+            },
+        );
+
+        let compiled = compile(&topology).unwrap();
+        step(&topology, &compiled, &mut payloads, 0.5);
+
+        let omega_after_injection = match payloads.read(rotor_port) {
+            Some(PortPayload::Rotational {
+                angular_velocity,
+                ..
+            }) => angular_velocity,
+            _ => panic!("端口应持有旋转载荷"),
+        };
+        assert!((omega_after_injection - 1.0).abs() < 1e-6);
+
+        // 注入扭矩已被消费，再步进转速不再变化。
+        step(&topology, &compiled, &mut payloads, 0.5);
+        let omega_after_free_step = match payloads.read(rotor_port) {
+            Some(PortPayload::Rotational {
+                angular_velocity,
+                ..
+            }) => angular_velocity,
+            _ => panic!("端口应持有旋转载荷"),
+        };
+        assert!((omega_after_free_step - 1.0).abs() < 1e-6);
     }
 }

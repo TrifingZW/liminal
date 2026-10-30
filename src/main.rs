@@ -1,5 +1,6 @@
 use liminal::payload::{PortPayload, PortPayloads};
 use liminal::simulator::Simulator;
+use liminal::spatial::Frame;
 use liminal::topology::VehicleTopology;
 use liminal::types::PortId;
 use liminal::units::rotational::{Axle, Engine, Wheel};
@@ -13,8 +14,15 @@ const DT: f32 = 0.001;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut topology = VehicleTopology::new();
 
+    // 挂点位于四角：X 右，Y 上，Z 前（liminal 载具坐标系）。
+    let mounts: Vec<Frame> =
+        [[-0.8, 0.0, 1.4], [0.8, 0.0, 1.4], [-0.8, 0.0, -1.4], [0.8, 0.0, -1.4]]
+            .iter()
+            .map(|&translation| Frame::translation(translation))
+            .collect();
+
     let cockpit = topology.add_node(CockpitInput);
-    let chassis = topology.add_node(Chassis::new(WHEELS));
+    let chassis = topology.add_node(Chassis::new(mounts));
     let engine = topology.add_node(Engine::new(300.0, 600.0, 0.5));
     let gearbox = topology.add_node(Gearbox::new([0.15, 0.25, 0.4, 0.6], 0.2));
     let axle = topology.add_node(Axle::new(WHEELS, 0.5));
@@ -48,9 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut wheel_shafts = Vec::with_capacity(WHEELS);
     for index in 0..WHEELS {
-        let suspension = topology.add_node(Suspension::new(35_000.0, 3_000.0, 0.35));
+        let suspension = topology.add_node(Suspension::new(35_000.0, 3_000.0, 0.35, 0.2, 0.5));
         let knuckle = topology.add_node(SteeringKnuckle::new(2_000.0));
-        let wheel = topology.add_node(Wheel::new(12.0, 30.0));
+        let wheel = topology.add_node(Wheel::new(12.0, 30.0, 0.3));
 
         let suspension_ports = topology.nodes()[suspension].ports.clone();
         let knuckle_ports = topology.nodes()[knuckle].ports.clone();

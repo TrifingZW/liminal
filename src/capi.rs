@@ -13,11 +13,11 @@ use slotmap::{Key, KeyData};
 
 use crate::payload::PortPayload;
 use crate::simulator::Simulator;
-use crate::spatial::SpatialJointDesc;
-use crate::tire::TireModel;
+use crate::spatial::{Frame, SpatialJointDesc};
+use crate::tire::{TireModel, WheelMotion};
 use crate::topology::VehicleTopology;
 use crate::types::{ConnectError, EdgeId, NodeId, PortId};
-use crate::units::rotational::{Axle, Engine, Wheel};
+use crate::units::rotational::{Axle, Differential, Engine, Wheel};
 use crate::units::signal::{CockpitInput, SignalSplitter};
 use crate::units::spatial::{Chassis, SteeringKnuckle, Suspension};
 use crate::units::transmission::{Brake, Clutch, Gearbox};
@@ -81,6 +81,25 @@ pub struct LiminalJointDesc {
     pub stiffness: f32,
     pub damping: f32,
     pub rest_length: f32,
+    pub min_length: f32,
+    pub max_length: f32,
+}
+
+/// 刚体变换：平移与四元数旋转，旋转分量顺序为 (x, y, z, w)。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiminalFrame {
+    pub translation: LiminalVec3,
+    pub rotation: [f32; 4],
+}
+
+impl Default for LiminalFrame {
+    fn default() -> Self {
+        Self {
+            translation: LiminalVec3::default(),
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
 }
 
 /// 空间运动学树中的一条父子连接。
@@ -93,6 +112,10 @@ pub struct LiminalSpatialLink {
     /// `has_control` 为 0 时无意义。
     pub control_port: u64,
     pub has_control: u32,
+    /// 静止位形下子节点相对父节点的位姿。
+    pub rest_pose: LiminalFrame,
+    /// 静止位形下子节点相对运动学树根的位姿。
+    pub pose_in_root: LiminalFrame,
 }
 
 /// 信号执行计划中的一条拷贝指令。
@@ -157,6 +180,8 @@ fn joint_to_ffi(joint: SpatialJointDesc) -> LiminalJointDesc {
             stiffness: 0.0,
             damping: 0.0,
             rest_length: 0.0,
+            min_length: 0.0,
+            max_length: 0.0,
         },
         SpatialJointDesc::Revolute {
             axis,
@@ -170,12 +195,16 @@ fn joint_to_ffi(joint: SpatialJointDesc) -> LiminalJointDesc {
             stiffness: 0.0,
             damping: 0.0,
             rest_length: 0.0,
+            min_length: 0.0,
+            max_length: 0.0,
         },
         SpatialJointDesc::PrismaticSpring {
             axis,
             stiffness,
             damping,
             rest_length,
+            min_length,
+            max_length,
         } => LiminalJointDesc {
             kind: LiminalJointKind::PrismaticSpring,
             axis: LiminalVec3 {
@@ -186,7 +215,27 @@ fn joint_to_ffi(joint: SpatialJointDesc) -> LiminalJointDesc {
             stiffness,
             damping,
             rest_length,
+            min_length,
+            max_length,
         },
+    }
+}
+
+fn frame_to_ffi(frame: Frame) -> LiminalFrame {
+    LiminalFrame {
+        translation: LiminalVec3 {
+            x: frame.translation[0],
+            y: frame.translation[1],
+            z: frame.translation[2],
+        },
+        rotation: frame.rotation,
+    }
+}
+
+fn frame_from_ffi(frame: LiminalFrame) -> Frame {
+    Frame {
+        translation: [frame.translation.x, frame.translation.y, frame.translation.z],
+        rotation: frame.rotation,
     }
 }
 
@@ -281,15 +330,35 @@ pub unsafe extern "C" fn liminal_vehicle_add_axle(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn liminal_vehicle_add_differential(
+    vehicle: *mut LiminalVehicle,
+    output_count: usize,
+    coupling: f32,
+    max_torque: f32,
+    inertia: f32,
+    out_node: *mut u64,
+) -> LiminalStatus {
+    if output_count == 0 {
+        return LiminalStatus::InvalidArgument;
+    }
+    unsafe {
+        push_node(vehicle, out_node, |topology| {
+            topology.add_node(Differential::new(output_count, coupling, max_torque, inertia))
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_vehicle_add_wheel(
     vehicle: *mut LiminalVehicle,
     inertia: f32,
     friction_torque: f32,
+    radius: f32,
     out_node: *mut u64,
 ) -> LiminalStatus {
     unsafe {
         push_node(vehicle, out_node, |topology| {
-            topology.add_node(Wheel::new(inertia, friction_torque))
+            topology.add_node(Wheel::new(inertia, friction_torque, radius))
         })
     }
 }
@@ -321,10 +390,18 @@ pub unsafe extern "C" fn liminal_vehicle_add_clutch(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_vehicle_add_chassis(
     vehicle: *mut LiminalVehicle,
+    mounts: *const LiminalFrame,
     mount_count: usize,
     out_node: *mut u64,
 ) -> LiminalStatus {
-    unsafe { push_node(vehicle, out_node, |topology| topology.add_node(Chassis::new(mount_count))) }
+    if mounts.is_null() || mount_count == 0 {
+        return LiminalStatus::InvalidArgument;
+    }
+    let mounts = unsafe { slice::from_raw_parts(mounts, mount_count) }
+        .iter()
+        .map(|&frame| frame_from_ffi(frame))
+        .collect();
+    unsafe { push_node(vehicle, out_node, |topology| topology.add_node(Chassis::new(mounts))) }
 }
 
 #[unsafe(no_mangle)]
@@ -333,11 +410,19 @@ pub unsafe extern "C" fn liminal_vehicle_add_suspension(
     stiffness: f32,
     damping: f32,
     rest_length: f32,
+    min_length: f32,
+    max_length: f32,
     out_node: *mut u64,
 ) -> LiminalStatus {
     unsafe {
         push_node(vehicle, out_node, |topology| {
-            topology.add_node(Suspension::new(stiffness, damping, rest_length))
+            topology.add_node(Suspension::new(
+                stiffness,
+                damping,
+                rest_length,
+                min_length,
+                max_length,
+            ))
         })
     }
 }
@@ -562,6 +647,30 @@ pub unsafe extern "C" fn liminal_vehicle_read_omega(
     }
 }
 
+/// 向旋转端口注入外部扭矩（如轮胎反作用力矩），覆盖式写入，在下一次步进中被消费并清零。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liminal_vehicle_write_torque(
+    vehicle: *mut LiminalVehicle,
+    port: u64,
+    torque: f32,
+) -> LiminalStatus {
+    let Some(vehicle) = (unsafe { vehicle.as_mut() }) else {
+        return LiminalStatus::InvalidHandle;
+    };
+    let Some(slot) = vehicle.simulator.payloads_mut().get_mut(port_from_ffi(port)) else {
+        return LiminalStatus::PortNotFound;
+    };
+    let PortPayload::Rotational {
+        torque: slot_torque,
+        ..
+    } = slot
+    else {
+        return LiminalStatus::WrongPayload;
+    };
+    *slot_torque = torque;
+    LiminalStatus::Ok
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_vehicle_signal_op_count(
     vehicle: *const LiminalVehicle,
@@ -635,6 +744,8 @@ pub unsafe extern "C" fn liminal_vehicle_spatial_link(
         joint: joint_to_ffi(link.joint()),
         control_port: link.control_port().map(port_to_ffi).unwrap_or(0),
         has_control: u32::from(link.control_port().is_some()),
+        rest_pose: frame_to_ffi(link.rest_pose()),
+        pose_in_root: frame_to_ffi(link.pose_in_root()),
     };
     LiminalStatus::Ok
 }
@@ -661,6 +772,42 @@ pub extern "C" fn liminal_tire_forces(
     }
 }
 
+/// 冲量模式轮胎解：纵向按本步内对齐轮面与地面速度所需冲量折算，
+/// 侧向按侧偏刚度，合力按摩擦圆裁剪。
+#[unsafe(no_mangle)]
+pub extern "C" fn liminal_tire_impulse_forces(
+    friction_coefficient: f32,
+    lateral_stiffness: f32,
+    angular_velocity: f32,
+    ground_speed: f32,
+    radius: f32,
+    wheel_inertia: f32,
+    slip_angle: f32,
+    normal_force: f32,
+    dt: f32,
+) -> LiminalTireForces {
+    let model = TireModel {
+        friction_coefficient,
+        longitudinal_stiffness: 0.0,
+        lateral_stiffness,
+    };
+    let forces = model.impulse_forces(
+        WheelMotion {
+            angular_velocity,
+            ground_speed,
+            radius,
+            inertia: wheel_inertia,
+        },
+        slip_angle,
+        normal_force,
+        dt,
+    );
+    LiminalTireForces {
+        longitudinal: forces.longitudinal,
+        lateral: forces.lateral,
+    }
+}
+
 /// 由悬挂压缩量与压缩速度计算法向力。
 #[unsafe(no_mangle)]
 pub extern "C" fn liminal_suspension_force(
@@ -669,17 +816,18 @@ pub extern "C" fn liminal_suspension_force(
     compression: f32,
     compression_velocity: f32,
 ) -> f32 {
-    Suspension::new(stiffness, damping, 0.0).normal_force(compression, compression_velocity)
+    Suspension::new(stiffness, damping, 0.0, 0.0, 0.0)
+        .normal_force(compression, compression_velocity)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LiminalJointKind, LiminalSpatialLink, LiminalStatus, LiminalVehicle,
-        liminal_suspension_force, liminal_tire_forces, liminal_vehicle_add_chassis,
-        liminal_vehicle_add_engine, liminal_vehicle_add_knuckle, liminal_vehicle_add_suspension,
-        liminal_vehicle_add_wheel, liminal_vehicle_connect, liminal_vehicle_free,
-        liminal_vehicle_is_dirty, liminal_vehicle_new, liminal_vehicle_port,
+        LiminalFrame, LiminalJointKind, LiminalSpatialLink, LiminalStatus, LiminalVec3,
+        LiminalVehicle, liminal_suspension_force, liminal_tire_forces, liminal_tire_impulse_forces,
+        liminal_vehicle_add_chassis, liminal_vehicle_add_engine, liminal_vehicle_add_knuckle,
+        liminal_vehicle_add_suspension, liminal_vehicle_add_wheel, liminal_vehicle_connect,
+        liminal_vehicle_free, liminal_vehicle_is_dirty, liminal_vehicle_new, liminal_vehicle_port,
         liminal_vehicle_read_omega, liminal_vehicle_recompile, liminal_vehicle_spatial_link,
         liminal_vehicle_spatial_link_count, liminal_vehicle_step, liminal_vehicle_write_signal,
     };
@@ -704,7 +852,10 @@ mod tests {
                 LiminalStatus::Ok
             );
             let mut wheel = 0u64;
-            assert_eq!(liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, &mut wheel), LiminalStatus::Ok);
+            assert_eq!(
+                liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, 0.3, &mut wheel),
+                LiminalStatus::Ok
+            );
 
             let throttle = port(vehicle, engine, 0);
             let engine_shaft = port(vehicle, engine, 1);
@@ -742,7 +893,10 @@ mod tests {
                 liminal_vehicle_add_engine(vehicle, 100.0, 100.0, 1.0, &mut engine),
                 LiminalStatus::Ok
             );
-            assert_eq!(liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, &mut wheel), LiminalStatus::Ok);
+            assert_eq!(
+                liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, 0.3, &mut wheel),
+                LiminalStatus::Ok
+            );
 
             let throttle = port(vehicle, engine, 0);
             let wheel_shaft = port(vehicle, wheel, 0);
@@ -762,13 +916,27 @@ mod tests {
             let mut suspension = 0u64;
             let mut knuckle = 0u64;
             let mut wheel = 0u64;
-            assert_eq!(liminal_vehicle_add_chassis(vehicle, 1, &mut chassis), LiminalStatus::Ok);
+            let mount = LiminalFrame {
+                translation: LiminalVec3 {
+                    x: 0.5,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            };
             assert_eq!(
-                liminal_vehicle_add_suspension(vehicle, 30.0, 3.0, 0.2, &mut suspension),
+                liminal_vehicle_add_chassis(vehicle, &mount, 1, &mut chassis),
+                LiminalStatus::Ok
+            );
+            assert_eq!(
+                liminal_vehicle_add_suspension(vehicle, 30.0, 3.0, 0.2, 0.1, 0.3, &mut suspension),
                 LiminalStatus::Ok
             );
             assert_eq!(liminal_vehicle_add_knuckle(vehicle, 50.0, &mut knuckle), LiminalStatus::Ok);
-            assert_eq!(liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, &mut wheel), LiminalStatus::Ok);
+            assert_eq!(
+                liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, 0.3, &mut wheel),
+                LiminalStatus::Ok
+            );
 
             let chassis_mount = port(vehicle, chassis, 0);
             let suspension_top = port(vehicle, suspension, 0);
@@ -802,6 +970,13 @@ mod tests {
             assert_eq!(link.has_control, 1);
             assert_eq!(link.control_port, knuckle_steering);
 
+            // 车轮链接：静止位姿链 = 挂点 [0.5, 0, 1] 下悬自由长度 0.2。
+            assert_eq!(liminal_vehicle_spatial_link(vehicle, 2, &mut link), LiminalStatus::Ok);
+            assert!((link.pose_in_root.translation.x - 0.5).abs() < 1e-6);
+            assert!((link.pose_in_root.translation.y + 0.2).abs() < 1e-6);
+            assert!((link.pose_in_root.translation.z - 1.0).abs() < 1e-6);
+            assert_eq!(link.pose_in_root.rotation, [0.0, 0.0, 0.0, 1.0]);
+
             liminal_vehicle_free(vehicle);
         }
     }
@@ -824,5 +999,13 @@ mod tests {
         assert!((forces.longitudinal - 1.0).abs() < 1e-5);
         let force = liminal_suspension_force(100.0, 10.0, 0.1, 0.0);
         assert!((force - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn impulse_tire_helper_matches_core_model() {
+        // J=1, R=0.5, ω=0, v=1, dt=0.01 → 冲量 -4 N·s → 力 -400 N；上限 1000 不裁剪。
+        let forces = liminal_tire_impulse_forces(1.0, 100.0, 0.0, 1.0, 0.5, 1.0, 0.0, 1000.0, 0.01);
+        assert!((forces.longitudinal + 400.0).abs() < 1e-3);
+        assert_eq!(forces.lateral, 0.0);
     }
 }

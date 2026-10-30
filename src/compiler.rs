@@ -6,7 +6,7 @@ use std::fmt;
 use smallvec::SmallVec;
 
 use crate::payload::{PortPayload, PortPayloads};
-use crate::spatial::SpatialJointDesc;
+use crate::spatial::{Frame, SpatialJointDesc};
 use crate::topology::VehicleTopology;
 use crate::types::{NodeId, PortDomain, PortId};
 
@@ -68,6 +68,10 @@ pub struct SpatialLink {
     child: NodeId,
     joint: SpatialJointDesc,
     control_port: Option<PortId>,
+    /// 静止位形下子节点相对父节点的位姿。
+    rest_pose: Frame,
+    /// 静止位形下子节点相对运动学树根（底盘）的位姿。
+    pose_in_root: Frame,
 }
 
 impl SpatialLink {
@@ -89,6 +93,16 @@ impl SpatialLink {
     /// 驱动该关节的信号端口，供宿主适配层读取目标角等控制量。
     pub fn control_port(&self) -> Option<PortId> {
         self.control_port
+    }
+
+    /// 静止位形下子节点相对父节点的位姿：`T_parentMount ∘ T_childMount⁻¹`。
+    pub fn rest_pose(&self) -> Frame {
+        self.rest_pose
+    }
+
+    /// 静止位形下子节点相对运动学树根的位姿，由链式复合求得。
+    pub fn pose_in_root(&self) -> Frame {
+        self.pose_in_root
     }
 }
 
@@ -131,7 +145,8 @@ impl CompiledVehicle {
 /// 将拓扑编译为运行态执行数据。
 ///
 /// 信号域按单元级数据流拓扑排序，生成边拷贝与内部转发的扁平指令；旋转域执行连通分量分解，
-/// 将动力链打包为可独立求解的岛；空间域从底盘出发生成运动学树。
+/// 将动力链打包为可独立求解的岛；空间域从底盘出发生成运动学树，
+/// 并沿挂载位姿链推导每个子节点的静止位形。
 pub fn compile(topology: &VehicleTopology) -> Result<CompiledVehicle, CompileError> {
     let signal_plan = compile_signal_plan(topology)?;
     let drivetrain_islands = compile_drivetrain_islands(topology);
@@ -349,16 +364,17 @@ fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
     }
 
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue = VecDeque::new();
+    // 队列携带节点相对树根的静止位姿，根节点为单位变换。
+    let mut queue: VecDeque<(NodeId, Frame)> = VecDeque::new();
     let mut links = Vec::new();
     visited.insert(root);
-    queue.push_back(root);
+    queue.push_back((root, Frame::IDENTITY));
 
-    while let Some(parent) = queue.pop_front() {
+    while let Some((parent, parent_pose)) = queue.pop_front() {
         let Some(node) = topology.nodes().get(parent) else {
             continue;
         };
-        for &port in &node.ports {
+        for (parent_index, &port) in node.ports.iter().enumerate() {
             let Some(neighbors) = adjacency.get(&port) else {
                 continue;
             };
@@ -372,6 +388,17 @@ fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
                 let Some(child_node) = topology.nodes().get(child) else {
                     continue;
                 };
+                let Some(child_index) = child_node.ports.iter().position(|&p| p == neighbor) else {
+                    continue;
+                };
+
+                // 静止位形下两端挂载位姿重合：T_childInParent = T_parentMount ∘ T_childMount⁻¹。
+                let parent_mount = node.unit.port_mount(parent_index).unwrap_or(Frame::IDENTITY);
+                let child_mount =
+                    child_node.unit.port_mount(child_index).unwrap_or(Frame::IDENTITY);
+                let rest_pose = parent_mount.then(&child_mount.inverse());
+                let pose_in_root = parent_pose.then(&rest_pose);
+
                 let control_port = child_node
                     .unit
                     .spatial_control_port()
@@ -381,8 +408,10 @@ fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
                     child,
                     joint: child_node.unit.spatial_joint(),
                     control_port,
+                    rest_pose,
+                    pose_in_root,
                 });
-                queue.push_back(child);
+                queue.push_back((child, pose_in_root));
             }
         }
     }

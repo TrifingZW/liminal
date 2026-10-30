@@ -4,7 +4,7 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::payload::PortPayload;
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::units::{RotationalCoupling, UnitContext, VehicleUnit};
+use crate::units::{RotationalCoupling, TorqueKind, UnitContext, VehicleUnit};
 
 /// 变速箱：挡位信号选择传动比，空挡断开内部耦合。
 ///
@@ -228,6 +228,14 @@ impl VehicleUnit for Brake {
         ]
     }
 
+    fn port_torque_kind(&self, _context: &UnitContext<'_>, port_index: usize) -> TorqueKind {
+        if port_index == Self::SHAFT_PORT {
+            TorqueKind::Resist
+        } else {
+            TorqueKind::Drive
+        }
+    }
+
     fn port_torque(&self, context: &UnitContext<'_>, port_index: usize) -> f32 {
         if port_index != Self::SHAFT_PORT {
             return 0.0;
@@ -277,7 +285,7 @@ mod tests {
         let cockpit = topology.add_node(CockpitInput);
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
         let gearbox = topology.add_node(Gearbox::new([0.5], 1.0));
-        let wheel = topology.add_node(Wheel::new(1.0, 5.0));
+        let wheel = topology.add_node(Wheel::new(1.0, 5.0, 0.3));
 
         let cockpit_ports = topology.nodes()[cockpit].ports.clone();
         let engine_ports = topology.nodes()[engine].ports.clone();
@@ -318,7 +326,7 @@ mod tests {
         let cockpit = topology.add_node(CockpitInput);
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
         let gearbox = topology.add_node(Gearbox::new([0.5], 1.0));
-        let wheel = topology.add_node(Wheel::new(1.0, 5.0));
+        let wheel = topology.add_node(Wheel::new(1.0, 5.0, 0.3));
 
         let cockpit_ports = topology.nodes()[cockpit].ports.clone();
         let engine_ports = topology.nodes()[engine].ports.clone();
@@ -358,7 +366,7 @@ mod tests {
         let mut topology = VehicleTopology::new();
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
         let clutch = topology.add_node(Clutch::new(20.0, 0.5, 1.0));
-        let wheel = topology.add_node(Wheel::new(1.0, 0.0));
+        let wheel = topology.add_node(Wheel::new(1.0, 0.0, 0.3));
 
         let engine_ports = topology.nodes()[engine].ports.clone();
         let clutch_ports = topology.nodes()[clutch].ports.clone();
@@ -403,7 +411,7 @@ mod tests {
         let mut topology = VehicleTopology::new();
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
         let clutch = topology.add_node(Clutch::new(100.0, 0.5, 1.0));
-        let wheel = topology.add_node(Wheel::new(1.0, 0.0));
+        let wheel = topology.add_node(Wheel::new(1.0, 0.0, 0.3));
 
         let engine_ports = topology.nodes()[engine].ports.clone();
         let clutch_ports = topology.nodes()[clutch].ports.clone();

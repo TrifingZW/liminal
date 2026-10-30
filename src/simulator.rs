@@ -108,7 +108,7 @@ mod tests {
         let cockpit = topology.add_node(CockpitInput);
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
         let gearbox = topology.add_node(Gearbox::new([0.5], 1.0));
-        let wheel = topology.add_node(Wheel::new(1.0, 0.0));
+        let wheel = topology.add_node(Wheel::new(1.0, 0.0, 0.3));
 
         let cockpit_ports = topology.nodes()[cockpit].ports.clone();
         let engine_ports = topology.nodes()[engine].ports.clone();
