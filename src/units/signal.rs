@@ -93,6 +93,14 @@ impl VehicleUnit for SignalSplitter {
         }
         descriptors
     }
+
+    fn signal_routes(&self) -> SmallVec<[(usize, usize); 4]> {
+        let mut routes = SmallVec::with_capacity(self.output_count);
+        for index in 0..self.output_count {
+            routes.push((Self::INPUT_PORT, Self::output_port(index)));
+        }
+        routes
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +166,51 @@ mod tests {
         topology.connect(second_port, first_port).unwrap();
 
         assert!(matches!(compile(&topology), Err(CompileError::SignalCycle { .. })));
+    }
+
+    #[test]
+    fn splitter_forwards_input_to_all_outputs() {
+        struct SinkUnit;
+
+        impl VehicleUnit for SinkUnit {
+            fn port_descriptors(&self) -> SmallVec<[PortDescriptor; 8]> {
+                smallvec![PortDescriptor {
+                    name: "in".into(),
+                    domain: PortDomain::SignalScalar,
+                    direction: PortDirection::Input,
+                    max_connections: 1,
+                }]
+            }
+        }
+
+        let mut topology = VehicleTopology::new();
+        let cockpit = topology.add_node(CockpitInput);
+        let splitter = topology.add_node(SignalSplitter::new(2));
+        let first = topology.add_node(SinkUnit);
+        let second = topology.add_node(SinkUnit);
+
+        let cockpit_ports = topology.nodes()[cockpit].ports.clone();
+        let splitter_ports = topology.nodes()[splitter].ports.clone();
+        let first_ports = topology.nodes()[first].ports.clone();
+        let second_ports = topology.nodes()[second].ports.clone();
+
+        topology
+            .connect(
+                cockpit_ports[CockpitInput::THROTTLE_PORT],
+                splitter_ports[SignalSplitter::INPUT_PORT],
+            )
+            .unwrap();
+        topology.connect(splitter_ports[SignalSplitter::output_port(0)], first_ports[0]).unwrap();
+        topology.connect(splitter_ports[SignalSplitter::output_port(1)], second_ports[0]).unwrap();
+
+        let mut payloads = PortPayloads::new();
+        payloads.rebuild(&topology);
+        payloads.write(cockpit_ports[CockpitInput::THROTTLE_PORT], PortPayload::Signal(0.7));
+
+        let compiled = compile(&topology).unwrap();
+        compiled.sync_signals(&mut payloads);
+
+        assert_eq!(payloads.read(first_ports[0]), Some(PortPayload::Signal(0.7)));
+        assert_eq!(payloads.read(second_ports[0]), Some(PortPayload::Signal(0.7)));
     }
 }

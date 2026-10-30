@@ -57,15 +57,21 @@ impl Simulator {
         &mut self.payloads
     }
 
+    /// 按当前拓扑立即重编译，并对齐载荷槽位。
+    pub fn recompile(&mut self) -> Result<(), CompileError> {
+        self.compiled = compile(&self.topology)?;
+        self.payloads.rebuild(&self.topology);
+        self.topology.clear_dirty();
+        Ok(())
+    }
+
     /// 推进一个物理帧。
     ///
     /// 拓扑变更时先重编译并对齐载荷槽位，再同步控制信号、推进 1D 动力流。
     /// 空间刚体积分与轮胎接触由宿主适配层在调用本方法前后完成。
     pub fn step(&mut self, dt: f32) -> Result<(), CompileError> {
         if self.topology.is_dirty() {
-            self.compiled = compile(&self.topology)?;
-            self.payloads.rebuild(&self.topology);
-            self.topology.clear_dirty();
+            self.recompile()?;
         }
 
         self.compiled.sync_signals(&mut self.payloads);

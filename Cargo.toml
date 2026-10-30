@@ -3,6 +3,10 @@ name = "liminal"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "liminal"
+crate-type = ["staticlib", "rlib"]
+
 [dependencies]
 slotmap = "1.1.1"
 smallvec = "1.16.4"

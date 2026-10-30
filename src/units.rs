@@ -89,6 +89,13 @@ pub trait VehicleUnit: Send + Sync {
         RotationalCoupling::Rigid
     }
 
+    /// 信号端口转发映射：`(输入端口索引, 输出端口索引)`。
+    ///
+    /// 在信号同步阶段按单元拓扑序执行，用于分发器等无状态信号单元。
+    fn signal_routes(&self) -> SmallVec<[(usize, usize); 4]> {
+        SmallVec::new()
+    }
+
     /// 单元在空间连接上附加的相对运动自由度，默认刚性。
     fn spatial_joint(&self) -> SpatialJointDesc {
         SpatialJointDesc::Rigid

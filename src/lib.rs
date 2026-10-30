@@ -1,5 +1,6 @@
 //! 多域端口图载具仿真库。
 
+pub mod capi;
 pub mod compiler;
 pub mod payload;
 pub mod simulator;

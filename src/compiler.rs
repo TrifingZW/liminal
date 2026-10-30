@@ -101,7 +101,7 @@ pub struct CompiledVehicle {
 }
 
 impl CompiledVehicle {
-    /// 信号域的扁平指令表，按拓扑序排列，源端口在前。
+    /// 信号域的扁平指令表：按单元拓扑序排列的边拷贝与单元内部转发。
     pub fn signal_plan(&self) -> &[(PortId, PortId)] {
         &self.signal_plan
     }
@@ -130,7 +130,7 @@ impl CompiledVehicle {
 
 /// 将拓扑编译为运行态执行数据。
 ///
-/// 信号域执行 Kahn 拓扑排序生成扁平拷贝指令；旋转域执行连通分量分解，
+/// 信号域按单元级数据流拓扑排序，生成边拷贝与内部转发的扁平指令；旋转域执行连通分量分解，
 /// 将动力链打包为可独立求解的岛；空间域从底盘出发生成运动学树。
 pub fn compile(topology: &VehicleTopology) -> Result<CompiledVehicle, CompileError> {
     let signal_plan = compile_signal_plan(topology)?;
@@ -145,57 +145,104 @@ pub fn compile(topology: &VehicleTopology) -> Result<CompiledVehicle, CompileErr
 }
 
 fn compile_signal_plan(topology: &VehicleTopology) -> Result<Vec<(PortId, PortId)>, CompileError> {
-    let mut indegree: HashMap<PortId, usize> = HashMap::new();
-    let mut adjacency: HashMap<PortId, SmallVec<[PortId; 4]>> = HashMap::new();
+    let mut outgoing: HashMap<NodeId, SmallVec<[(PortId, PortId); 8]>> = HashMap::new();
+    let mut indegree: HashMap<NodeId, usize> = HashMap::new();
     for edge in topology.edges().values() {
         if edge.domain != PortDomain::SignalScalar {
             continue;
         }
-        adjacency.entry(edge.source_port).or_default().push(edge.target_port);
-        *indegree.entry(edge.target_port).or_insert(0) += 1;
+        let Some(source) = topology.ports().get(edge.source_port) else {
+            continue;
+        };
+        let Some(target) = topology.ports().get(edge.target_port) else {
+            continue;
+        };
+        outgoing.entry(source.owner).or_default().push((edge.source_port, edge.target_port));
+        *indegree.entry(target.owner).or_insert(0) += 1;
     }
 
-    let mut signal_port_count = 0usize;
-    let mut queue = VecDeque::new();
-    for (port_id, port) in topology.ports().iter() {
-        if port.desc.domain != PortDomain::SignalScalar {
+    let mut routes: HashMap<NodeId, SmallVec<[(PortId, PortId); 4]>> = HashMap::new();
+    let mut signal_units: SmallVec<[NodeId; 16]> = SmallVec::new();
+    for (node_id, node) in topology.nodes().iter() {
+        if !node.ports.iter().any(|&port| is_signal(topology, port)) {
             continue;
         }
-        signal_port_count += 1;
-        if !indegree.contains_key(&port_id) {
-            queue.push_back(port_id);
+        signal_units.push(node_id);
+
+        let mut mapped: SmallVec<[(PortId, PortId); 4]> = SmallVec::new();
+        for &(input, output) in node.unit.signal_routes().iter() {
+            let Some(&source) = node.ports.get(input) else {
+                continue;
+            };
+            let Some(&target) = node.ports.get(output) else {
+                continue;
+            };
+            if is_signal(topology, source) && is_signal(topology, target) {
+                mapped.push((source, target));
+            }
+        }
+        if !mapped.is_empty() {
+            routes.insert(node_id, mapped);
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    for &node_id in &signal_units {
+        if !indegree.contains_key(&node_id) {
+            queue.push_back(node_id);
         }
     }
 
     let mut plan = Vec::with_capacity(topology.edges().len());
-    let mut processed = 0usize;
-    while let Some(port) = queue.pop_front() {
-        processed += 1;
-        let Some(targets) = adjacency.get(&port) else {
+    let mut processed: HashSet<NodeId> = HashSet::new();
+    while let Some(unit) = queue.pop_front() {
+        processed.insert(unit);
+
+        if let Some(unit_routes) = routes.get(&unit) {
+            plan.extend(unit_routes.iter().copied());
+        }
+
+        let Some(edges) = outgoing.get(&unit) else {
             continue;
         };
-        for &target in targets {
-            plan.push((port, target));
-            let remaining = indegree.get_mut(&target).expect("信号边的目标端口必然已登记入度");
+        for &(source_port, target_port) in edges {
+            plan.push((source_port, target_port));
+            let Some(target) = topology.ports().get(target_port) else {
+                continue;
+            };
+            let remaining =
+                indegree.get_mut(&target.owner).expect("信号边的目标单元必然已登记入度");
             *remaining -= 1;
             if *remaining == 0 {
-                queue.push_back(target);
+                queue.push_back(target.owner);
             }
         }
     }
 
-    if processed != signal_port_count {
-        let ports = indegree
-            .iter()
-            .filter(|(_, remaining)| **remaining > 0)
-            .map(|(&port, _)| port)
-            .collect();
+    if processed.len() != signal_units.len() {
+        let mut ports = SmallVec::new();
+        for &node_id in &signal_units {
+            if processed.contains(&node_id) {
+                continue;
+            }
+            if let Some(node) = topology.nodes().get(node_id) {
+                for &port in &node.ports {
+                    if is_signal(topology, port) {
+                        ports.push(port);
+                    }
+                }
+            }
+        }
         return Err(CompileError::SignalCycle {
             ports,
         });
     }
 
     Ok(plan)
+}
+
+fn is_signal(topology: &VehicleTopology, port: PortId) -> bool {
+    topology.ports().get(port).is_some_and(|entry| entry.desc.domain == PortDomain::SignalScalar)
 }
 
 fn compile_drivetrain_islands(topology: &VehicleTopology) -> Vec<DrivetrainIsland> {
