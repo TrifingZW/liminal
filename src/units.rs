@@ -63,7 +63,7 @@ pub enum RotationalCoupling {
 /// 1D 旋转域的速度级约束描述。
 ///
 /// 端口索引为节点端口表顺序，与 [`VehicleUnit::port_descriptors`] 一致。
-/// 求解器把端口映射到转速连通组后统一求解，约束冲量受 `max_torque·dt` 限制。
+/// 求解器把端口映射到转速连通组后统一求解，摩擦约束的冲量受 `max_torque·dt` 限制。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RotationalConstraint {
     /// 开式差速：`ω_in = (1/N)·Σω_out`，输出端等扭矩分配。

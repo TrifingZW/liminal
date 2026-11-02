@@ -26,7 +26,7 @@
 - Rotational1D —— 一维旋转机械，承载扭矩（**Torque**）与角速度（**Angular Velocity**）
   - 固定传动比把端口并合为转速连通组（**Body**），组内折算到参考轴：`J_eq = ΣJ·r²`、`ω_port = r·ω_body`
   - 单元可声明速度级约束：开式差速强制 `ω_in = mean(ω_out)` 并等扭矩分配；库仑摩擦在扭矩上限内锁止相对转速（制动器、离合器、车轮摩擦）
-  - 约束以顺序冲量（**Sequential Impulses / PGS**）迭代求解，冲量上限为 `max_torque·dt`；驱动与外部注入扭矩按冲量施加，单步消费后清零
+  - 约束以顺序冲量（**Sequential Impulses / PGS**）迭代求解，库仑摩擦的冲量上限为 `max_torque·dt`；驱动与外部注入扭矩按冲量施加，单步消费后清零
   - 发动机：全油门扭矩曲线（归一化转速线性插值）、怠速比例控制、发动机制动（速度比例的库仑摩擦约束）
 - Spatial6DoF —— 空间挂接；库产出关节描述符（Rigid / Revolute / PrismaticSpring，含行程限制）与静止位姿（**Rest Pose**），约束的构建与求解在物理引擎侧
 - SignalScalar —— 控制信号；编译为按拓扑序排列的扁平拷贝指令表，逐帧同步，存在有向环时编译失败
