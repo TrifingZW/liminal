@@ -10,16 +10,19 @@ use std::ptr;
 use std::slice;
 
 use slotmap::{Key, KeyData};
+use smallvec::SmallVec;
 
 use crate::payload::PortPayload;
 use crate::simulator::Simulator;
 use crate::spatial::{Frame, SpatialJointDesc};
-use crate::tire::{TireModel, WheelMotion};
+use crate::tire::{TireForces, TireModel, WheelMotion};
 use crate::topology::VehicleTopology;
 use crate::types::{ConnectError, EdgeId, NodeId, PortId};
-use crate::units::rotational::{Axle, Differential, Engine, Wheel};
+use crate::units::rotational::{
+    Axle, Differential, Engine, EngineParameters, TorqueCurvePoint, Wheel,
+};
 use crate::units::signal::{CockpitInput, SignalSplitter};
-use crate::units::spatial::{Chassis, SteeringKnuckle, Suspension};
+use crate::units::spatial::{Chassis, SteeringKnuckle, Suspension, anti_roll_force};
 use crate::units::transmission::{Brake, Clutch, Gearbox};
 
 /// 三维向量。
@@ -31,12 +34,46 @@ pub struct LiminalVec3 {
     pub z: f32,
 }
 
-/// 轮胎坐标系下的合力。
+/// 轮胎坐标系下的合力与车轮反作用。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiminalTireForces {
     pub longitudinal: f32,
     pub lateral: f32,
+    pub wheel_torque: f32,
+}
+
+impl From<TireForces> for LiminalTireForces {
+    fn from(forces: TireForces) -> Self {
+        Self {
+            longitudinal: forces.longitudinal,
+            lateral: forces.lateral,
+            wheel_torque: forces.wheel_torque,
+        }
+    }
+}
+
+/// 轮胎模型参数。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiminalTireModel {
+    pub friction_coefficient: f32,
+    pub lateral_stiffness: f32,
+    pub load_sensitivity: f32,
+    pub reference_load: f32,
+    pub rolling_resistance: f32,
+}
+
+impl From<LiminalTireModel> for TireModel {
+    fn from(params: LiminalTireModel) -> Self {
+        Self {
+            friction_coefficient: params.friction_coefficient,
+            lateral_stiffness: params.lateral_stiffness,
+            load_sensitivity: params.load_sensitivity,
+            reference_load: params.reference_load,
+            rolling_resistance: params.rolling_resistance,
+        }
+    }
 }
 
 /// C ABI 状态码。
@@ -59,17 +96,12 @@ pub enum LiminalStatus {
 
 /// 空间关节类型。
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LiminalJointKind {
+    #[default]
     Rigid = 0,
     Revolute = 1,
     PrismaticSpring = 2,
-}
-
-impl Default for LiminalJointKind {
-    fn default() -> Self {
-        Self::Rigid
-    }
 }
 
 /// 空间关节描述。
@@ -83,6 +115,49 @@ pub struct LiminalJointDesc {
     pub rest_length: f32,
     pub min_length: f32,
     pub max_length: f32,
+}
+
+/// 发动机全油门扭矩曲线采样点。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiminalEngineCurvePoint {
+    /// 归一化角速度 `ω/ω_max`。
+    pub speed_ratio: f32,
+    /// 全油门扭矩相对 `max_torque` 的比例。
+    pub torque_scale: f32,
+}
+
+/// 发动机参数。
+///
+/// `curve` 为 `nullptr` 或 `curve_count` 为 0 时使用线性衰减；
+/// `idle_angular_velocity` 或 `idle_torque_limit` 为 0 时关闭怠速控制；
+/// `engine_braking_torque` 为 0 时关闭发动机制动。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiminalEngineParams {
+    pub max_torque: f32,
+    pub max_angular_velocity: f32,
+    pub inertia: f32,
+    pub idle_angular_velocity: f32,
+    pub idle_torque_limit: f32,
+    pub engine_braking_torque: f32,
+    pub curve: *const LiminalEngineCurvePoint,
+    pub curve_count: usize,
+}
+
+impl Default for LiminalEngineParams {
+    fn default() -> Self {
+        Self {
+            max_torque: 0.0,
+            max_angular_velocity: 0.0,
+            inertia: 0.0,
+            idle_angular_velocity: 0.0,
+            idle_torque_limit: 0.0,
+            engine_braking_torque: 0.0,
+            curve: ptr::null(),
+            curve_count: 0,
+        }
+    }
 }
 
 /// 刚体变换：平移与四元数旋转，旋转分量顺序为 (x, y, z, w)。
@@ -299,6 +374,62 @@ pub unsafe extern "C" fn liminal_vehicle_add_engine(
 }
 
 #[unsafe(no_mangle)]
+/// 按高级参数创建发动机节点。
+///
+/// # Safety
+///
+/// `params` 必须指向有效的 [`LiminalEngineParams`]；`curve` 非空时须指向至少
+/// `curve_count` 个有效的 [`LiminalEngineCurvePoint`]。
+pub unsafe extern "C" fn liminal_vehicle_add_engine_with_params(
+    vehicle: *mut LiminalVehicle,
+    params: *const LiminalEngineParams,
+    out_node: *mut u64,
+) -> LiminalStatus {
+    if params.is_null() {
+        return LiminalStatus::InvalidArgument;
+    }
+    let params = unsafe { *params };
+
+    if !params.max_torque.is_finite()
+        || !params.max_angular_velocity.is_finite()
+        || !params.inertia.is_finite()
+        || !params.idle_angular_velocity.is_finite()
+        || !params.idle_torque_limit.is_finite()
+        || !params.engine_braking_torque.is_finite()
+        || (params.curve.is_null() && params.curve_count > 0)
+    {
+        return LiminalStatus::InvalidArgument;
+    }
+
+    let curve: SmallVec<[TorqueCurvePoint; 8]> = if params.curve_count == 0 {
+        SmallVec::new()
+    } else {
+        let points = unsafe { slice::from_raw_parts(params.curve, params.curve_count) };
+        points
+            .iter()
+            .map(|point| TorqueCurvePoint {
+                speed_ratio: point.speed_ratio,
+                torque_scale: point.torque_scale,
+            })
+            .collect()
+    };
+
+    unsafe {
+        push_node(vehicle, out_node, |topology| {
+            topology.add_node(Engine::with_parameters(EngineParameters {
+                max_torque: params.max_torque,
+                max_angular_velocity: params.max_angular_velocity,
+                inertia: params.inertia,
+                idle_angular_velocity: params.idle_angular_velocity,
+                idle_torque_limit: params.idle_torque_limit,
+                engine_braking_torque: params.engine_braking_torque,
+                curve,
+            }))
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_vehicle_add_gearbox(
     vehicle: *mut LiminalVehicle,
     ratios: *const f32,
@@ -329,11 +460,11 @@ pub unsafe extern "C" fn liminal_vehicle_add_axle(
     }
 }
 
+/// 添加差速器：开式差速约束 + 输出端之间的摩擦限滑，`max_torque` 为限滑扭矩容量。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_vehicle_add_differential(
     vehicle: *mut LiminalVehicle,
     output_count: usize,
-    coupling: f32,
     max_torque: f32,
     inertia: f32,
     out_node: *mut u64,
@@ -343,7 +474,7 @@ pub unsafe extern "C" fn liminal_vehicle_add_differential(
     }
     unsafe {
         push_node(vehicle, out_node, |topology| {
-            topology.add_node(Differential::new(output_count, coupling, max_torque, inertia))
+            topology.add_node(Differential::new(output_count, max_torque, inertia))
         })
     }
 }
@@ -376,14 +507,11 @@ pub unsafe extern "C" fn liminal_vehicle_add_brake(
 pub unsafe extern "C" fn liminal_vehicle_add_clutch(
     vehicle: *mut LiminalVehicle,
     max_torque: f32,
-    lock_threshold: f32,
     inertia: f32,
     out_node: *mut u64,
 ) -> LiminalStatus {
     unsafe {
-        push_node(vehicle, out_node, |topology| {
-            topology.add_node(Clutch::new(max_torque, lock_threshold, inertia))
-        })
+        push_node(vehicle, out_node, |topology| topology.add_node(Clutch::new(max_torque, inertia)))
     }
 }
 
@@ -750,34 +878,13 @@ pub unsafe extern "C" fn liminal_vehicle_spatial_link(
     LiminalStatus::Ok
 }
 
-/// 由滑移率、侧偏角与法向载荷计算轮胎力。
+/// 轮胎冲量解：纵向按本步内对齐轮面与地面速度所需冲量折算，
+/// 侧向按侧偏刚度，合力按摩擦圆裁剪，并叠加滚动阻力。
+///
+/// `wheel_torque` 仅含摩擦力矩，滚动阻力不产生车轮反作用。
 #[unsafe(no_mangle)]
-pub extern "C" fn liminal_tire_forces(
-    friction_coefficient: f32,
-    longitudinal_stiffness: f32,
-    lateral_stiffness: f32,
-    slip_ratio: f32,
-    slip_angle: f32,
-    normal_force: f32,
-) -> LiminalTireForces {
-    let model = TireModel {
-        friction_coefficient,
-        longitudinal_stiffness,
-        lateral_stiffness,
-    };
-    let forces = model.forces(slip_ratio, slip_angle, normal_force);
-    LiminalTireForces {
-        longitudinal: forces.longitudinal,
-        lateral: forces.lateral,
-    }
-}
-
-/// 冲量模式轮胎解：纵向按本步内对齐轮面与地面速度所需冲量折算，
-/// 侧向按侧偏刚度，合力按摩擦圆裁剪。
-#[unsafe(no_mangle)]
-pub extern "C" fn liminal_tire_impulse_forces(
-    friction_coefficient: f32,
-    lateral_stiffness: f32,
+pub unsafe extern "C" fn liminal_tire_impulse_forces(
+    model: *const LiminalTireModel,
     angular_velocity: f32,
     ground_speed: f32,
     radius: f32,
@@ -786,26 +893,22 @@ pub extern "C" fn liminal_tire_impulse_forces(
     normal_force: f32,
     dt: f32,
 ) -> LiminalTireForces {
-    let model = TireModel {
-        friction_coefficient,
-        longitudinal_stiffness: 0.0,
-        lateral_stiffness,
+    let Some(model) = (unsafe { model.as_ref() }) else {
+        return LiminalTireForces::default();
     };
-    let forces = model.impulse_forces(
-        WheelMotion {
-            angular_velocity,
-            ground_speed,
-            radius,
-            inertia: wheel_inertia,
-        },
-        slip_angle,
-        normal_force,
-        dt,
-    );
-    LiminalTireForces {
-        longitudinal: forces.longitudinal,
-        lateral: forces.lateral,
-    }
+    TireModel::from(*model)
+        .impulse_forces(
+            WheelMotion {
+                angular_velocity,
+                ground_speed,
+                radius,
+                inertia: wheel_inertia,
+            },
+            slip_angle,
+            normal_force,
+            dt,
+        )
+        .into()
 }
 
 /// 由悬挂压缩量与压缩速度计算法向力。
@@ -820,12 +923,24 @@ pub extern "C" fn liminal_suspension_force(
         .normal_force(compression, compression_velocity)
 }
 
+/// 防倾杆：由两侧悬挂压缩量计算附加在 A 侧的法向力（N），B 侧取反。
+#[unsafe(no_mangle)]
+pub extern "C" fn liminal_anti_roll_force(
+    stiffness: f32,
+    compression_a: f32,
+    compression_b: f32,
+) -> f32 {
+    anti_roll_force(stiffness, compression_a, compression_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LiminalFrame, LiminalJointKind, LiminalSpatialLink, LiminalStatus, LiminalVec3,
-        LiminalVehicle, liminal_suspension_force, liminal_tire_forces, liminal_tire_impulse_forces,
-        liminal_vehicle_add_chassis, liminal_vehicle_add_engine, liminal_vehicle_add_knuckle,
+        LiminalEngineCurvePoint, LiminalEngineParams, LiminalFrame, LiminalJointKind,
+        LiminalSpatialLink, LiminalStatus, LiminalTireModel, LiminalVec3, LiminalVehicle,
+        liminal_anti_roll_force, liminal_suspension_force, liminal_tire_impulse_forces,
+        liminal_vehicle_add_chassis, liminal_vehicle_add_engine,
+        liminal_vehicle_add_engine_with_params, liminal_vehicle_add_knuckle,
         liminal_vehicle_add_suspension, liminal_vehicle_add_wheel, liminal_vehicle_connect,
         liminal_vehicle_free, liminal_vehicle_is_dirty, liminal_vehicle_new, liminal_vehicle_port,
         liminal_vehicle_read_omega, liminal_vehicle_recompile, liminal_vehicle_spatial_link,
@@ -861,14 +976,14 @@ mod tests {
             let engine_shaft = port(vehicle, engine, 1);
             let wheel_shaft = port(vehicle, wheel, 0);
 
-            assert_eq!(unsafe { liminal_vehicle_is_dirty(vehicle) }, 1);
+            assert_eq!(liminal_vehicle_is_dirty(vehicle), 1);
 
             assert_eq!(
                 liminal_vehicle_connect(vehicle, engine_shaft, wheel_shaft, ptr::null_mut()),
                 LiminalStatus::Ok
             );
             assert_eq!(liminal_vehicle_recompile(vehicle), LiminalStatus::Ok);
-            assert_eq!(unsafe { liminal_vehicle_is_dirty(vehicle) }, 0);
+            assert_eq!(liminal_vehicle_is_dirty(vehicle), 0);
             assert_eq!(liminal_vehicle_write_signal(vehicle, throttle, 1.0), LiminalStatus::Ok);
             assert_eq!(liminal_vehicle_step(vehicle, 0.01), LiminalStatus::Ok);
 
@@ -994,18 +1109,140 @@ mod tests {
     }
 
     #[test]
-    fn pure_helpers_match_core_models() {
-        let forces = liminal_tire_forces(1.0, 100.0, 100.0, 0.01, 0.0, 500.0);
-        assert!((forces.longitudinal - 1.0).abs() < 1e-5);
+    fn suspension_and_anti_roll_helpers_match_core_models() {
         let force = liminal_suspension_force(100.0, 10.0, 0.1, 0.0);
         assert!((force - 10.0).abs() < 1e-5);
+
+        let anti_roll = liminal_anti_roll_force(1_000.0, 0.06, 0.04);
+        assert!((anti_roll - 20.0).abs() < 1e-5);
     }
 
     #[test]
     fn impulse_tire_helper_matches_core_model() {
+        let model = LiminalTireModel {
+            friction_coefficient: 1.0,
+            lateral_stiffness: 100.0,
+            ..LiminalTireModel::default()
+        };
         // J=1, R=0.5, ω=0, v=1, dt=0.01 → 冲量 -4 N·s → 力 -400 N；上限 1000 不裁剪。
-        let forces = liminal_tire_impulse_forces(1.0, 100.0, 0.0, 1.0, 0.5, 1.0, 0.0, 1000.0, 0.01);
+        let forces =
+            unsafe { liminal_tire_impulse_forces(&model, 0.0, 1.0, 0.5, 1.0, 0.0, 1_000.0, 0.01) };
         assert!((forces.longitudinal + 400.0).abs() < 1e-3);
+        assert!((forces.wheel_torque - 200.0).abs() < 1e-3);
         assert_eq!(forces.lateral, 0.0);
+    }
+
+    #[test]
+    fn tire_helper_applies_load_sensitivity_and_rolling_resistance() {
+        let model = LiminalTireModel {
+            friction_coefficient: 1.0,
+            lateral_stiffness: 0.0,
+            load_sensitivity: 0.1,
+            reference_load: 1_000.0,
+            rolling_resistance: 0.02,
+            ..LiminalTireModel::default()
+        };
+        // 自由滚动（ωR = v）：纵向摩擦力为零，仅剩滚动阻力。
+        let forces =
+            unsafe { liminal_tire_impulse_forces(&model, 10.0, 5.0, 0.5, 1.0, 0.0, 1_000.0, 0.01) };
+        assert!((forces.longitudinal + 20.0).abs() < 1e-3);
+        assert_eq!(forces.wheel_torque, 0.0);
+    }
+
+    #[test]
+    fn null_tire_model_yields_zero_impulse() {
+        let impulses = unsafe {
+            liminal_tire_impulse_forces(ptr::null(), 10.0, 0.0, 0.5, 1.0, 0.0, 500.0, 0.01)
+        };
+        assert_eq!(impulses.longitudinal, 0.0);
+        assert_eq!(impulses.lateral, 0.0);
+        assert_eq!(impulses.wheel_torque, 0.0);
+    }
+
+    #[test]
+    fn engine_params_control_idle_and_curve() {
+        unsafe {
+            let vehicle = liminal_vehicle_new();
+            assert!(!vehicle.is_null());
+
+            let curve = [
+                LiminalEngineCurvePoint {
+                    speed_ratio: 0.0,
+                    torque_scale: 0.5,
+                },
+                LiminalEngineCurvePoint {
+                    speed_ratio: 1.0,
+                    torque_scale: 0.0,
+                },
+            ];
+            let params = LiminalEngineParams {
+                max_torque: 100.0,
+                max_angular_velocity: 600.0,
+                inertia: 0.5,
+                idle_angular_velocity: 100.0,
+                idle_torque_limit: 50.0,
+                engine_braking_torque: 30.0,
+                curve: curve.as_ptr(),
+                curve_count: curve.len(),
+            };
+
+            let mut engine = 0u64;
+            assert_eq!(
+                liminal_vehicle_add_engine_with_params(vehicle, &params, &mut engine),
+                LiminalStatus::Ok
+            );
+
+            let shaft = port(vehicle, engine, 1);
+            assert_eq!(liminal_vehicle_step(vehicle, 0.01), LiminalStatus::Ok);
+
+            let mut omega = 0.0f32;
+            assert_eq!(liminal_vehicle_read_omega(vehicle, shaft, &mut omega), LiminalStatus::Ok);
+            assert!(omega > 0.0, "怠速控制器应使发动机转动，omega = {omega}");
+
+            liminal_vehicle_free(vehicle);
+        }
+    }
+
+    #[test]
+    fn engine_params_reject_invalid_values() {
+        unsafe {
+            let vehicle = liminal_vehicle_new();
+            assert!(!vehicle.is_null());
+            let mut engine = 0u64;
+
+            assert_eq!(
+                liminal_vehicle_add_engine_with_params(vehicle, ptr::null(), &mut engine),
+                LiminalStatus::InvalidArgument
+            );
+
+            let mut params = LiminalEngineParams {
+                max_torque: 100.0,
+                max_angular_velocity: 600.0,
+                ..Default::default()
+            };
+            params.max_torque = f32::NAN;
+            assert_eq!(
+                liminal_vehicle_add_engine_with_params(vehicle, &params, &mut engine),
+                LiminalStatus::InvalidArgument
+            );
+
+            params.max_torque = 100.0;
+            params.curve_count = 1;
+            assert_eq!(
+                liminal_vehicle_add_engine_with_params(vehicle, &params, &mut engine),
+                LiminalStatus::InvalidArgument
+            );
+
+            // 非有限值与结构错误被拒绝；负值由单元构造钳制。
+            params.curve_count = 0;
+            params.max_torque = -1.0;
+            params.max_angular_velocity = 0.0;
+            assert_eq!(
+                liminal_vehicle_add_engine_with_params(vehicle, &params, &mut engine),
+                LiminalStatus::Ok
+            );
+
+            liminal_vehicle_free(vehicle);
+        }
     }
 }

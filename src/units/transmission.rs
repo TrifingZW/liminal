@@ -4,7 +4,7 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::payload::PortPayload;
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::units::{RotationalCoupling, TorqueKind, UnitContext, VehicleUnit};
+use crate::units::{RotationalConstraint, RotationalCoupling, UnitContext, VehicleUnit};
 
 /// 变速箱：挡位信号选择传动比，空挡断开内部耦合。
 ///
@@ -27,7 +27,7 @@ impl Gearbox {
     pub fn new(ratios: impl IntoIterator<Item = f32>, inertia: f32) -> Self {
         Self {
             ratios: ratios.into_iter().collect(),
-            inertia,
+            inertia: inertia.max(0.0),
         }
     }
 }
@@ -75,13 +75,13 @@ impl VehicleUnit for Gearbox {
     }
 }
 
-/// 离合器：按压紧信号在两端轴之间传递摩擦扭矩，转速差足够小时锁死合并。
+/// 离合器：按压紧信号在两端轴之间传递摩擦扭矩。
 ///
-/// 锁死判据简化为转速差阈值，未计入扭矩容量校验。
+/// 以库仑摩擦约束 `ω_in - ω_out = 0` 建模，扭矩上限为 `engagement·max_torque`：
+/// 需求扭矩在上限内时锁死同步，超出时以最大扭矩滑摩。
 #[derive(Debug, Clone, Copy)]
 pub struct Clutch {
     max_torque: f32,
-    lock_threshold: f32,
     inertia: f32,
 }
 
@@ -93,12 +93,11 @@ impl Clutch {
     /// 输出端轴端口在节点端口表中的索引。
     pub const OUTPUT_PORT: usize = 2;
 
-    /// `lock_threshold` 为锁死判据的转速差，单位 rad/s。
-    pub fn new(max_torque: f32, lock_threshold: f32, inertia: f32) -> Self {
+    /// 创建指定扭矩上限与转动惯量的离合器。
+    pub fn new(max_torque: f32, inertia: f32) -> Self {
         Self {
-            max_torque,
-            lock_threshold,
-            inertia,
+            max_torque: max_torque.max(0.0),
+            inertia: inertia.max(0.0),
         }
     }
 
@@ -107,25 +106,6 @@ impl Clutch {
             Some(PortPayload::Signal(value)) => value.clamp(0.0, 1.0),
             _ => 0.0,
         }
-    }
-
-    fn angular_velocity(&self, context: &UnitContext<'_>, index: usize) -> f32 {
-        match context.read(index) {
-            Some(PortPayload::Rotational {
-                angular_velocity,
-                ..
-            }) => angular_velocity,
-            _ => 0.0,
-        }
-    }
-
-    fn is_locked(&self, context: &UnitContext<'_>) -> bool {
-        if self.engagement(context) <= 0.0 {
-            return false;
-        }
-        let delta = self.angular_velocity(context, Self::INPUT_PORT)
-            - self.angular_velocity(context, Self::OUTPUT_PORT);
-        delta.abs() <= self.lock_threshold
     }
 }
 
@@ -157,34 +137,30 @@ impl VehicleUnit for Clutch {
         self.inertia
     }
 
-    fn rotational_coupling(&self, context: &UnitContext<'_>) -> RotationalCoupling {
-        if self.is_locked(context) {
-            RotationalCoupling::Ratios(smallvec![(Self::OUTPUT_PORT, 1.0)])
-        } else {
-            RotationalCoupling::Disconnected
-        }
+    fn rotational_coupling(&self, _context: &UnitContext<'_>) -> RotationalCoupling {
+        RotationalCoupling::Disconnected
     }
 
-    fn port_torque(&self, context: &UnitContext<'_>, port_index: usize) -> f32 {
-        if self.is_locked(context) {
-            return 0.0;
-        }
+    fn rotational_constraints(
+        &self,
+        context: &UnitContext<'_>,
+    ) -> SmallVec<[RotationalConstraint; 8]> {
         let engagement = self.engagement(context);
         if engagement <= 0.0 {
-            return 0.0;
+            return SmallVec::new();
         }
-        let delta = self.angular_velocity(context, Self::INPUT_PORT)
-            - self.angular_velocity(context, Self::OUTPUT_PORT);
-        let magnitude = engagement * self.max_torque;
-        match port_index {
-            Self::INPUT_PORT => -delta.signum() * magnitude,
-            Self::OUTPUT_PORT => delta.signum() * magnitude,
-            _ => 0.0,
-        }
+        smallvec![RotationalConstraint::Friction {
+            port_a: Self::INPUT_PORT,
+            port_b: Some(Self::OUTPUT_PORT),
+            max_torque: engagement * self.max_torque,
+        }]
     }
 }
 
-/// 制动器：按制动信号在所在旋转轴上施加与转向相反的阻力矩。
+/// 制动器：按制动信号对所在旋转轴施加库仑摩擦约束。
+///
+/// 扭矩上限为 `engagement·max_torque`；需求扭矩在上限内时轴保持静止，
+/// 超出时以最大扭矩滑摩，因此不存在静止蠕行。
 #[derive(Debug, Clone, Copy)]
 pub struct Brake {
     max_torque: f32,
@@ -198,7 +174,7 @@ impl Brake {
 
     pub fn new(max_torque: f32) -> Self {
         Self {
-            max_torque,
+            max_torque: max_torque.max(0.0),
         }
     }
 
@@ -228,33 +204,19 @@ impl VehicleUnit for Brake {
         ]
     }
 
-    fn port_torque_kind(&self, _context: &UnitContext<'_>, port_index: usize) -> TorqueKind {
-        if port_index == Self::SHAFT_PORT {
-            TorqueKind::Resist
-        } else {
-            TorqueKind::Drive
-        }
-    }
-
-    fn port_torque(&self, context: &UnitContext<'_>, port_index: usize) -> f32 {
-        if port_index != Self::SHAFT_PORT {
-            return 0.0;
-        }
+    fn rotational_constraints(
+        &self,
+        context: &UnitContext<'_>,
+    ) -> SmallVec<[RotationalConstraint; 8]> {
         let engagement = self.engagement(context);
         if engagement <= 0.0 {
-            return 0.0;
+            return SmallVec::new();
         }
-        let angular_velocity = match context.read(Self::SHAFT_PORT) {
-            Some(PortPayload::Rotational {
-                angular_velocity,
-                ..
-            }) => angular_velocity,
-            _ => 0.0,
-        };
-        if angular_velocity.abs() <= f32::EPSILON {
-            return 0.0;
-        }
-        -angular_velocity.signum() * engagement * self.max_torque
+        smallvec![RotationalConstraint::Friction {
+            port_a: Self::SHAFT_PORT,
+            port_b: None,
+            max_torque: engagement * self.max_torque,
+        }]
     }
 }
 
@@ -365,7 +327,7 @@ mod tests {
     fn slipping_clutch_transfers_opposing_torques() {
         let mut topology = VehicleTopology::new();
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
-        let clutch = topology.add_node(Clutch::new(20.0, 0.5, 1.0));
+        let clutch = topology.add_node(Clutch::new(20.0, 1.0));
         let wheel = topology.add_node(Wheel::new(1.0, 0.0, 0.3));
 
         let engine_ports = topology.nodes()[engine].ports.clone();
@@ -410,7 +372,7 @@ mod tests {
     fn clutch_locks_when_sides_are_synchronized() {
         let mut topology = VehicleTopology::new();
         let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
-        let clutch = topology.add_node(Clutch::new(100.0, 0.5, 1.0));
+        let clutch = topology.add_node(Clutch::new(100.0, 1.0));
         let wheel = topology.add_node(Wheel::new(1.0, 0.0, 0.3));
 
         let engine_ports = topology.nodes()[engine].ports.clone();
@@ -436,6 +398,40 @@ mod tests {
         let wheel_omega = angular_velocity(&payloads, wheel_ports[Wheel::SHAFT_PORT]);
         assert!(engine_omega > 0.0);
         assert!((engine_omega - wheel_omega).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clutch_holds_load_within_torque_capacity() {
+        let mut topology = VehicleTopology::new();
+        let engine = topology.add_node(Engine::new(10.0, 1_000.0, 1.0));
+        let clutch = topology.add_node(Clutch::new(50.0, 1.0));
+        let wheel = topology.add_node(Wheel::new(1.0, 0.0, 0.3));
+
+        let engine_ports = topology.nodes()[engine].ports.clone();
+        let clutch_ports = topology.nodes()[clutch].ports.clone();
+        let wheel_ports = topology.nodes()[wheel].ports.clone();
+
+        topology
+            .connect(engine_ports[Engine::SHAFT_PORT], clutch_ports[Clutch::INPUT_PORT])
+            .unwrap();
+        topology
+            .connect(clutch_ports[Clutch::OUTPUT_PORT], wheel_ports[Wheel::SHAFT_PORT])
+            .unwrap();
+
+        let mut payloads = PortPayloads::new();
+        payloads.rebuild(&topology);
+        payloads.write(engine_ports[Engine::THROTTLE_PORT], PortPayload::Signal(1.0));
+        payloads.write(clutch_ports[Clutch::ENGAGE_PORT], PortPayload::Signal(1.0));
+
+        let compiled = compile(&topology).unwrap();
+        for _ in 0..20 {
+            step(&topology, &compiled, &mut payloads, 0.0025);
+        }
+
+        let engine_omega = angular_velocity(&payloads, engine_ports[Engine::SHAFT_PORT]);
+        let wheel_omega = angular_velocity(&payloads, wheel_ports[Wheel::SHAFT_PORT]);
+        assert!(engine_omega > 0.0);
+        assert!((engine_omega - wheel_omega).abs() < 1e-4);
     }
 
     #[test]

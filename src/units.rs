@@ -49,15 +49,6 @@ impl<'a> UnitContext<'a> {
     }
 }
 
-/// 端口扭矩的动力学分类，供 1D 求解器选择防过冲策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TorqueKind {
-    /// 驱动扭矩：来源与转速无关（发动机、离合器传递），允许转速自然跨零。
-    Drive,
-    /// 阻性扭矩：方向随转速符号翻转（摩擦、制动），求解器钳制其跨零过冲。
-    Resist,
-}
-
 /// 单元内部旋转端口之间的耦合方式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RotationalCoupling {
@@ -67,6 +58,31 @@ pub enum RotationalCoupling {
     Disconnected,
     /// 显式耦合：`(节点端口索引, 相对首个旋转端口的角速度比)`，未列出的端口不参与。
     Ratios(SmallVec<[(usize, f32); 4]>),
+}
+
+/// 1D 旋转域的速度级约束描述。
+///
+/// 端口索引为节点端口表顺序，与 [`VehicleUnit::port_descriptors`] 一致。
+/// 求解器把端口映射到转速连通组后统一求解，约束冲量受 `max_torque·dt` 限制。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RotationalConstraint {
+    /// 开式差速：`ω_in = (1/N)·Σω_out`，输出端等扭矩分配。
+    OpenDifferential {
+        /// 输入端端口索引。
+        input_port: usize,
+        /// 输出端端口索引列表。
+        output_ports: SmallVec<[usize; 4]>,
+    },
+    /// 库仑摩擦：`ω_a - ω_b = 0`（`port_b` 为 `None` 时对地），
+    /// 传递扭矩上限为 `max_torque`（N·m）。
+    Friction {
+        /// 约束端口 a。
+        port_a: usize,
+        /// 约束端口 b；`None` 表示对地制动。
+        port_b: Option<usize>,
+        /// 最大传递扭矩（N·m），非正值表示无约束。
+        max_torque: f32,
+    },
 }
 
 /// 零部件单元的统一特征。
@@ -91,14 +107,6 @@ pub trait VehicleUnit: Send + Sync {
         0.0
     }
 
-    /// 指定端口扭矩的动力学分类，默认为驱动。
-    ///
-    /// 声明为 [`TorqueKind::Resist`] 的扭矩参与求解器的零过冲钳制，
-    /// 避免符号翻转类阻力矩在显式积分下的静止震荡。
-    fn port_torque_kind(&self, _context: &UnitContext<'_>, _port_index: usize) -> TorqueKind {
-        TorqueKind::Drive
-    }
-
     /// 空间端口在节点本地坐标系中的挂载位姿，未声明时视为单位变换。
     ///
     /// 连接两侧端口的挂载位姿在静止位形下重合，编译器据此推导空间运动学树中
@@ -112,6 +120,17 @@ pub trait VehicleUnit: Send + Sync {
     /// 上下文提供端口与载荷，供单元按挡位等信号动态决定传动比或断开。
     fn rotational_coupling(&self, _context: &UnitContext<'_>) -> RotationalCoupling {
         RotationalCoupling::Rigid
+    }
+
+    /// 1D 旋转域的速度级约束，默认无。
+    ///
+    /// 约束在动力岛求解阶段与端口耦合一并处理：
+    /// 开式差速强制输入转速为输出转速均值，摩擦约束在扭矩上限内锁止相对转速。
+    fn rotational_constraints(
+        &self,
+        _context: &UnitContext<'_>,
+    ) -> SmallVec<[RotationalConstraint; 8]> {
+        SmallVec::new()
     }
 
     /// 信号端口转发映射：`(输入端口索引, 输出端口索引)`。

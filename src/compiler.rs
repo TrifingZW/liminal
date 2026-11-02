@@ -303,10 +303,10 @@ fn compile_drivetrain_islands(topology: &VehicleTopology) -> Vec<DrivetrainIslan
         let mut stack = vec![port_id];
         while let Some(current) = stack.pop() {
             island.ports.push(current);
-            if let Some(owner_port) = topology.ports().get(current) {
-                if !island.nodes.contains(&owner_port.owner) {
-                    island.nodes.push(owner_port.owner);
-                }
+            if let Some(owner_port) = topology.ports().get(current)
+                && !island.nodes.contains(&owner_port.owner)
+            {
+                island.nodes.push(owner_port.owner);
             }
             if let Some(neighbors) = adjacency.get(&current) {
                 for &neighbor in neighbors {

@@ -5,7 +5,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::payload::PortPayload;
 use crate::spatial::{Frame, SpatialJointDesc};
 use crate::types::{PortDescriptor, PortDirection, PortDomain};
-use crate::units::{TorqueKind, UnitContext, VehicleUnit};
+use crate::units::{RotationalConstraint, UnitContext, VehicleUnit};
 
 /// 底盘：空间运动学树的根，每个挂载位姿孵化一个挂载端口。
 #[derive(Debug, Clone)]
@@ -84,6 +84,23 @@ impl Suspension {
     }
 }
 
+/// 防倾杆：由两侧悬挂压缩量计算附加在 A 侧的法向力（N），B 侧取反。
+///
+/// 压缩量正值为压缩；扭转弹簧抵抗两侧压缩差，成对力之和为零。
+/// 非有限输入或非正刚度返回零。
+///
+/// 适配层应在两侧车轮同时接地时调用；任一车轮离地时防倾杆不产生作用力。
+pub fn anti_roll_force(stiffness: f32, compression_a: f32, compression_b: f32) -> f32 {
+    if !stiffness.is_finite()
+        || stiffness <= 0.0
+        || !compression_a.is_finite()
+        || !compression_b.is_finite()
+    {
+        return 0.0;
+    }
+    stiffness * (compression_a - compression_b)
+}
+
 impl VehicleUnit for Suspension {
     fn port_descriptors(&self) -> SmallVec<[PortDescriptor; 8]> {
         smallvec![
@@ -119,7 +136,7 @@ impl VehicleUnit for Suspension {
     }
 }
 
-/// 转向节：悬挂与车轮之间的转向轴，并读取制动信号对车轮施加阻力矩。
+/// 转向节：悬挂与车轮之间的转向轴，并以库仑摩擦约束读取制动信号。
 #[derive(Debug, Clone, Copy)]
 pub struct SteeringKnuckle {
     max_brake_torque: f32,
@@ -139,7 +156,7 @@ impl SteeringKnuckle {
 
     pub fn new(max_brake_torque: f32) -> Self {
         Self {
-            max_brake_torque,
+            max_brake_torque: max_brake_torque.max(0.0),
         }
     }
 
@@ -197,39 +214,25 @@ impl VehicleUnit for SteeringKnuckle {
         Some(Self::STEERING_PORT)
     }
 
-    fn port_torque_kind(&self, _context: &UnitContext<'_>, port_index: usize) -> TorqueKind {
-        if port_index == Self::SHAFT_PORT {
-            TorqueKind::Resist
-        } else {
-            TorqueKind::Drive
-        }
-    }
-
-    fn port_torque(&self, context: &UnitContext<'_>, port_index: usize) -> f32 {
-        if port_index != Self::SHAFT_PORT {
-            return 0.0;
-        }
+    fn rotational_constraints(
+        &self,
+        context: &UnitContext<'_>,
+    ) -> SmallVec<[RotationalConstraint; 8]> {
         let engagement = self.signal(context, Self::BRAKE_PORT);
         if engagement <= 0.0 {
-            return 0.0;
+            return SmallVec::new();
         }
-        let angular_velocity = match context.read(Self::SHAFT_PORT) {
-            Some(PortPayload::Rotational {
-                angular_velocity,
-                ..
-            }) => angular_velocity,
-            _ => 0.0,
-        };
-        if angular_velocity.abs() <= f32::EPSILON {
-            return 0.0;
-        }
-        -angular_velocity.signum() * engagement * self.max_brake_torque
+        smallvec![RotationalConstraint::Friction {
+            port_a: Self::SHAFT_PORT,
+            port_b: None,
+            max_torque: engagement * self.max_brake_torque,
+        }]
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Chassis, SteeringKnuckle, Suspension};
+    use super::{Chassis, SteeringKnuckle, Suspension, anti_roll_force};
     use crate::compiler::compile;
     use crate::payload::{PortPayload, PortPayloads};
     use crate::solver_1d::step;
@@ -332,6 +335,22 @@ mod tests {
         let suspension = Suspension::new(100.0, 10.0, 0.3, 0.15, 0.45);
         assert!((suspension.normal_force(0.1, 0.0) - 10.0).abs() < 1e-5);
         assert_eq!(suspension.normal_force(-0.1, 0.0), 0.0);
+    }
+
+    #[test]
+    fn anti_roll_force_transfers_load_from_compressed_side() {
+        // 压缩更多的一侧获得附加法向力，另一侧等量卸载。
+        let force = anti_roll_force(1_000.0, 0.06, 0.04);
+        assert!((force - 20.0).abs() < 1e-5);
+        assert!((force + anti_roll_force(1_000.0, 0.04, 0.06)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn anti_roll_force_rejects_invalid_inputs() {
+        assert_eq!(anti_roll_force(0.0, 0.1, 0.0), 0.0);
+        assert_eq!(anti_roll_force(-1_000.0, 0.1, 0.0), 0.0);
+        assert_eq!(anti_roll_force(1_000.0, f32::NAN, 0.0), 0.0);
+        assert_eq!(anti_roll_force(1_000.0, 0.1, f32::INFINITY), 0.0);
     }
 
     #[test]
