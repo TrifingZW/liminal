@@ -3,18 +3,26 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 use crate::payload::{PortPayload, PortPayloads};
 use crate::spatial::{Frame, SpatialJointDesc};
 use crate::topology::VehicleTopology;
-use crate::types::{NodeId, PortDomain, PortId};
+use crate::types::{EdgeId, NodeId, PortDomain, PortId};
 
 /// 拓扑编译失败的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
     /// 信号域存在有向环，无法拓扑排序。
     SignalCycle {
+        ports: SmallVec<[PortId; 8]>,
+    },
+    /// 空间域存在环，无法展开为运动学树。
+    SpatialCycle {
+        ports: SmallVec<[PortId; 8]>,
+    },
+    /// 空间连接未连接到根节点，无法纳入运动学树。
+    SpatialDisconnected {
         ports: SmallVec<[PortId; 8]>,
     },
 }
@@ -26,6 +34,16 @@ impl fmt::Display for CompileError {
                 ports,
             } => {
                 write!(f, "信号域存在有向环，未能排序的端口：{ports:?}")
+            }
+            Self::SpatialCycle {
+                ports,
+            } => {
+                write!(f, "空间域存在环，无法展开为运动学树：{ports:?}")
+            }
+            Self::SpatialDisconnected {
+                ports,
+            } => {
+                write!(f, "空间连接未连接到根节点：{ports:?}")
             }
         }
     }
@@ -150,7 +168,7 @@ impl CompiledVehicle {
 pub fn compile(topology: &VehicleTopology) -> Result<CompiledVehicle, CompileError> {
     let signal_plan = compile_signal_plan(topology)?;
     let drivetrain_islands = compile_drivetrain_islands(topology);
-    let spatial_links = compile_spatial_tree(topology);
+    let spatial_links = compile_spatial_tree(topology)?;
 
     Ok(CompiledVehicle {
         signal_plan,
@@ -337,14 +355,21 @@ fn compile_drivetrain_islands(topology: &VehicleTopology) -> Vec<DrivetrainIslan
     islands
 }
 
-fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
+fn compile_spatial_tree(topology: &VehicleTopology) -> Result<Vec<SpatialLink>, CompileError> {
     let Some(root) = topology
         .nodes()
         .iter()
         .find(|(_, node)| node.unit.is_spatial_root())
         .map(|(node_id, _)| node_id)
     else {
-        return Vec::new();
+        if let Some(edge) =
+            topology.edges().values().find(|edge| edge.domain == PortDomain::Spatial6DoF)
+        {
+            return Err(CompileError::SpatialDisconnected {
+                ports: smallvec![edge.source_port, edge.target_port],
+            });
+        }
+        return Ok(Vec::new());
     };
 
     let mut owners: HashMap<PortId, NodeId> = HashMap::new();
@@ -354,20 +379,21 @@ fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
         }
     }
 
-    let mut adjacency: HashMap<PortId, SmallVec<[PortId; 4]>> = HashMap::new();
+    let mut adjacency: HashMap<PortId, SmallVec<[(PortId, EdgeId); 4]>> = HashMap::new();
     for edge in topology.edges().values() {
         if edge.domain != PortDomain::Spatial6DoF {
             continue;
         }
-        adjacency.entry(edge.source_port).or_default().push(edge.target_port);
-        adjacency.entry(edge.target_port).or_default().push(edge.source_port);
+        adjacency.entry(edge.source_port).or_default().push((edge.target_port, edge.id));
+        adjacency.entry(edge.target_port).or_default().push((edge.source_port, edge.id));
     }
 
-    let mut visited: HashSet<NodeId> = HashSet::new();
+    let mut visited_nodes: HashSet<NodeId> = HashSet::new();
+    let mut visited_edges: HashSet<EdgeId> = HashSet::new();
     // 队列携带节点相对树根的静止位姿，根节点为单位变换。
     let mut queue: VecDeque<(NodeId, Frame)> = VecDeque::new();
     let mut links = Vec::new();
-    visited.insert(root);
+    visited_nodes.insert(root);
     queue.push_back((root, Frame::IDENTITY));
 
     while let Some((parent, parent_pose)) = queue.pop_front() {
@@ -378,12 +404,18 @@ fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
             let Some(neighbors) = adjacency.get(&port) else {
                 continue;
             };
-            for &neighbor in neighbors {
+            for &(neighbor, edge_id) in neighbors {
+                // 无向边只沿树展开一次；再次遇到已遍历边是回边，不是新连接。
+                if !visited_edges.insert(edge_id) {
+                    continue;
+                }
                 let Some(&child) = owners.get(&neighbor) else {
                     continue;
                 };
-                if !visited.insert(child) {
-                    continue;
+                if !visited_nodes.insert(child) {
+                    return Err(CompileError::SpatialCycle {
+                        ports: smallvec![port, neighbor],
+                    });
                 }
                 let Some(child_node) = topology.nodes().get(child) else {
                     continue;
@@ -416,15 +448,25 @@ fn compile_spatial_tree(topology: &VehicleTopology) -> Vec<SpatialLink> {
         }
     }
 
-    links
+    for edge in topology.edges().values() {
+        if edge.domain == PortDomain::Spatial6DoF && !visited_edges.contains(&edge.id) {
+            return Err(CompileError::SpatialDisconnected {
+                ports: smallvec![edge.source_port, edge.target_port],
+            });
+        }
+    }
+
+    Ok(links)
 }
 
 #[cfg(test)]
 mod tests {
     use super::compile;
+    use crate::spatial::Frame;
     use crate::topology::VehicleTopology;
     use crate::types::{PortDescriptor, PortDirection, PortDomain};
     use crate::units::VehicleUnit;
+    use crate::units::spatial::{Chassis, Suspension};
     use smallvec::{SmallVec, smallvec};
 
     struct Shaft;
@@ -446,6 +488,34 @@ mod tests {
                 },
             ]
         }
+    }
+
+    #[test]
+    fn spatial_cycle_is_rejected() {
+        let mut topology = VehicleTopology::new();
+        let chassis = topology.add_node(Chassis::new(vec![Frame::IDENTITY, Frame::IDENTITY]));
+        let suspension = topology.add_node(Suspension::new(30.0, 3.0, 0.2, 0.1, 0.3));
+        let chassis_ports = topology.nodes()[chassis].ports.clone();
+        let suspension_ports = topology.nodes()[suspension].ports.clone();
+
+        topology.connect(chassis_ports[0], suspension_ports[Suspension::TOP_PORT]).unwrap();
+        topology.connect(chassis_ports[1], suspension_ports[Suspension::BOTTOM_PORT]).unwrap();
+
+        assert!(matches!(compile(&topology), Err(super::CompileError::SpatialCycle { .. })));
+    }
+
+    #[test]
+    fn disconnected_spatial_component_is_rejected() {
+        let mut topology = VehicleTopology::new();
+        topology.add_node(Chassis::new(vec![Frame::IDENTITY]));
+        let orphan_chassis = topology.add_node(Chassis::new(vec![Frame::IDENTITY]));
+        let orphan = topology.add_node(Suspension::new(30.0, 3.0, 0.2, 0.1, 0.3));
+        let orphan_ports = topology.nodes()[orphan_chassis].ports.clone();
+        let suspension_ports = topology.nodes()[orphan].ports.clone();
+
+        topology.connect(orphan_ports[0], suspension_ports[Suspension::TOP_PORT]).unwrap();
+
+        assert!(matches!(compile(&topology), Err(super::CompileError::SpatialDisconnected { .. })));
     }
 
     #[test]

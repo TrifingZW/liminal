@@ -57,6 +57,14 @@ impl Simulator {
         &mut self.payloads
     }
 
+    /// 查询旋转端口折算到该端口的等效转动惯量（kg·m²）。
+    ///
+    /// 用于宿主显式轮胎力耦合：轮胎冲量模型应使用该值，使锁止轴与低挡位工况
+    /// 下的车轮端惯量与传动链一致。
+    pub fn port_effective_inertia(&self, port: crate::types::PortId) -> Option<f32> {
+        solver_1d::port_effective_inertia(&self.topology, &self.compiled, &self.payloads, port)
+    }
+
     /// 按当前拓扑立即重编译，并对齐载荷槽位。
     pub fn recompile(&mut self) -> Result<(), CompileError> {
         self.compiled = compile(&self.topology)?;
@@ -100,6 +108,32 @@ mod tests {
             }) => angular_velocity,
             _ => panic!("端口应持有旋转载荷"),
         }
+    }
+
+    #[test]
+    fn effective_inertia_reflects_gear_ratio() {
+        let mut topology = VehicleTopology::new();
+        let engine = topology.add_node(Engine::new(100.0, 100.0, 1.0));
+        let gearbox = topology.add_node(Gearbox::new([0.5], 0.2));
+        let wheel = topology.add_node(Wheel::new(2.0, 0.0, 0.3));
+
+        let engine_ports = topology.nodes()[engine].ports.clone();
+        let gearbox_ports = topology.nodes()[gearbox].ports.clone();
+        let wheel_ports = topology.nodes()[wheel].ports.clone();
+
+        topology
+            .connect(engine_ports[Engine::SHAFT_PORT], gearbox_ports[Gearbox::INPUT_PORT])
+            .unwrap();
+        topology
+            .connect(gearbox_ports[Gearbox::OUTPUT_PORT], wheel_ports[Wheel::SHAFT_PORT])
+            .unwrap();
+
+        let mut simulator = Simulator::new(topology).unwrap();
+        simulator.payloads_mut().write(gearbox_ports[Gearbox::GEAR_PORT], PortPayload::Signal(1.0));
+
+        // 参考轴在发动机输入端：J_eq = 1.0 + 0.2 + 2.0·0.5² = 1.7；折算到车轮端除以 0.5²。
+        let inertia = simulator.port_effective_inertia(wheel_ports[Wheel::SHAFT_PORT]).unwrap();
+        assert!((inertia - 6.8).abs() < 1e-4);
     }
 
     #[test]
