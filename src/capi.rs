@@ -5,6 +5,9 @@
 //! - 所有函数检查空指针，错误以 [`LiminalStatus`] 返回；
 //! - `NodeId`/`PortId`/`EdgeId` 通过 slotmap 的 FFI 键值导出为 `u64`；
 //! - 句柄非线程安全，调用方需自行同步。
+//
+// 安全契约统一见模块文档与适配契约：所有 extern "C" 函数要求有效句柄与独占访问。
+#![allow(clippy::missing_safety_doc)]
 
 use std::ptr;
 use std::slice;
@@ -1140,7 +1143,6 @@ mod tests {
             load_sensitivity: 0.1,
             reference_load: 1_000.0,
             rolling_resistance: 0.02,
-            ..LiminalTireModel::default()
         };
         // 自由滚动（ωR = v）：纵向摩擦力为零，仅剩滚动阻力。
         let forces =
