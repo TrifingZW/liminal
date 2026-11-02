@@ -204,6 +204,15 @@ pub struct LiminalSignalOp {
     pub target_port: u64,
 }
 
+/// C ABI 版本：布局或语义发生不兼容变更时递增。
+pub const LIMINAL_ABI_VERSION: u32 = 1;
+
+/// 返回 C ABI 版本，供宿主在初始化时校验头文件与静态库是否匹配。
+#[unsafe(no_mangle)]
+pub extern "C" fn liminal_abi_version() -> u32 {
+    LIMINAL_ABI_VERSION
+}
+
 /// 不透明载具句柄。
 pub struct LiminalVehicle {
     simulator: Simulator,
@@ -778,6 +787,30 @@ pub unsafe extern "C" fn liminal_vehicle_read_omega(
     }
 }
 
+/// 查询旋转端口折算到该端口的等效转动惯量（kg·m²）。
+///
+/// 端口不在任何动力岛内或惯量为零时返回 `PortNotFound`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liminal_vehicle_effective_inertia(
+    vehicle: *const LiminalVehicle,
+    port: u64,
+    out_inertia: *mut f32,
+) -> LiminalStatus {
+    let Some(vehicle) = (unsafe { vehicle.as_ref() }) else {
+        return LiminalStatus::InvalidHandle;
+    };
+    let Some(out_inertia) = (unsafe { out_inertia.as_mut() }) else {
+        return LiminalStatus::InvalidArgument;
+    };
+    match vehicle.simulator.port_effective_inertia(port_from_ffi(port)) {
+        Some(inertia) => {
+            *out_inertia = inertia;
+            LiminalStatus::Ok
+        }
+        None => LiminalStatus::PortNotFound,
+    }
+}
+
 /// 向旋转端口注入外部扭矩（如轮胎反作用力矩），覆盖式写入，在下一次步进中被消费并清零。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_vehicle_write_torque(
@@ -893,6 +926,7 @@ pub unsafe extern "C" fn liminal_tire_impulse_forces(
     radius: f32,
     wheel_inertia: f32,
     slip_angle: f32,
+    lateral_speed: f32,
     normal_force: f32,
     dt: f32,
 ) -> LiminalTireForces {
@@ -908,6 +942,7 @@ pub unsafe extern "C" fn liminal_tire_impulse_forces(
                 inertia: wheel_inertia,
             },
             slip_angle,
+            lateral_speed,
             normal_force,
             dt,
         )
@@ -945,8 +980,9 @@ mod tests {
         liminal_vehicle_add_chassis, liminal_vehicle_add_engine,
         liminal_vehicle_add_engine_with_params, liminal_vehicle_add_knuckle,
         liminal_vehicle_add_suspension, liminal_vehicle_add_wheel, liminal_vehicle_connect,
-        liminal_vehicle_free, liminal_vehicle_is_dirty, liminal_vehicle_new, liminal_vehicle_port,
-        liminal_vehicle_read_omega, liminal_vehicle_recompile, liminal_vehicle_spatial_link,
+        liminal_vehicle_effective_inertia, liminal_vehicle_free, liminal_vehicle_is_dirty,
+        liminal_vehicle_new, liminal_vehicle_port, liminal_vehicle_read_omega,
+        liminal_vehicle_recompile, liminal_vehicle_spatial_link,
         liminal_vehicle_spatial_link_count, liminal_vehicle_step, liminal_vehicle_write_signal,
     };
     use std::ptr;
@@ -996,6 +1032,40 @@ mod tests {
                 LiminalStatus::Ok
             );
             assert!(omega > 0.0);
+
+            liminal_vehicle_free(vehicle);
+        }
+    }
+
+    #[test]
+    fn effective_inertia_is_exposed_through_c_abi() {
+        unsafe {
+            let vehicle = liminal_vehicle_new();
+            let mut engine = 0u64;
+            let mut wheel = 0u64;
+            assert_eq!(
+                liminal_vehicle_add_engine(vehicle, 100.0, 100.0, 1.0, &mut engine),
+                LiminalStatus::Ok
+            );
+            assert_eq!(
+                liminal_vehicle_add_wheel(vehicle, 1.0, 0.0, 0.3, &mut wheel),
+                LiminalStatus::Ok
+            );
+
+            let engine_shaft = port(vehicle, engine, 1);
+            let wheel_shaft = port(vehicle, wheel, 0);
+            assert_eq!(
+                liminal_vehicle_connect(vehicle, engine_shaft, wheel_shaft, ptr::null_mut()),
+                LiminalStatus::Ok
+            );
+            assert_eq!(liminal_vehicle_recompile(vehicle), LiminalStatus::Ok);
+
+            let mut inertia = 0.0f32;
+            assert_eq!(
+                liminal_vehicle_effective_inertia(vehicle, wheel_shaft, &mut inertia),
+                LiminalStatus::Ok
+            );
+            assert!((inertia - 2.0).abs() < 1e-5);
 
             liminal_vehicle_free(vehicle);
         }
@@ -1128,8 +1198,9 @@ mod tests {
             ..LiminalTireModel::default()
         };
         // J=1, R=0.5, ω=0, v=1, dt=0.01 → 冲量 -4 N·s → 力 -400 N；上限 1000 不裁剪。
-        let forces =
-            unsafe { liminal_tire_impulse_forces(&model, 0.0, 1.0, 0.5, 1.0, 0.0, 1_000.0, 0.01) };
+        let forces = unsafe {
+            liminal_tire_impulse_forces(&model, 0.0, 1.0, 0.5, 1.0, 0.0, 0.0, 1_000.0, 0.01)
+        };
         assert!((forces.longitudinal + 400.0).abs() < 1e-3);
         assert!((forces.wheel_torque - 200.0).abs() < 1e-3);
         assert_eq!(forces.lateral, 0.0);
@@ -1145,8 +1216,9 @@ mod tests {
             rolling_resistance: 0.02,
         };
         // 自由滚动（ωR = v）：纵向摩擦力为零，仅剩滚动阻力。
-        let forces =
-            unsafe { liminal_tire_impulse_forces(&model, 10.0, 5.0, 0.5, 1.0, 0.0, 1_000.0, 0.01) };
+        let forces = unsafe {
+            liminal_tire_impulse_forces(&model, 10.0, 5.0, 0.5, 1.0, 0.0, 0.0, 1_000.0, 0.01)
+        };
         assert!((forces.longitudinal + 20.0).abs() < 1e-3);
         assert_eq!(forces.wheel_torque, 0.0);
     }
@@ -1154,7 +1226,7 @@ mod tests {
     #[test]
     fn null_tire_model_yields_zero_impulse() {
         let impulses = unsafe {
-            liminal_tire_impulse_forces(ptr::null(), 10.0, 0.0, 0.5, 1.0, 0.0, 500.0, 0.01)
+            liminal_tire_impulse_forces(ptr::null(), 10.0, 0.0, 0.5, 1.0, 0.0, 0.0, 500.0, 0.01)
         };
         assert_eq!(impulses.longitudinal, 0.0);
         assert_eq!(impulses.lateral, 0.0);

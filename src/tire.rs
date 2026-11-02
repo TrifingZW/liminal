@@ -1,6 +1,10 @@
 //! 轮胎冲量模型：由车轮运动、侧偏角与法向载荷计算纵向与侧向力。
 
-/// 轮胎力模型参数。
+/// 低速侧向阻尼的参考速度（m/s）。
+/// 低于该速度时，侧向力从侧偏刚度平滑过渡到速度阻尼，提供静止侧向保持。
+pub const LOW_SPEED_REFERENCE: f32 = 1.0;
+
+/// 轮胎模型参数。
 #[derive(Debug, Clone, Copy)]
 pub struct TireModel {
     /// 参考载荷下的峰值附着系数。
@@ -61,15 +65,22 @@ impl TireModel {
         }
     }
 
-    /// 冲量解：纵向由本步内使轮面线速度对齐地面速度的冲量折算，侧向由侧偏刚度，
-    /// 合力按摩擦圆裁剪，并叠加滚动阻力。返回轮胎坐标系力（N）与车轮反作用力矩（N·m）。
+    /// 冲量解：纵向由本步内使轮面线速度对齐地面速度的冲量折算，侧向由侧偏刚度与
+    /// 低速速度阻尼共同给出，合力按摩擦圆裁剪，并叠加滚动阻力。
+    /// 返回轮胎坐标系力（N）与车轮反作用力矩（N·m）。
     ///
-    /// 纵向等效刚度为 `J/R²/dt`，与摩擦圆上限共同决定纵向力，无需额外刚度参数；
+    /// 纵向等效刚度为 `J_eff/R²/dt`，与摩擦圆上限共同决定纵向力，无需额外刚度参数；
     /// 冲量按目标速度对齐计算，低速时不会跨零震荡。
+    ///
+    /// `lateral_speed` 为接触点沿侧向的相对速度（m/s）。地面速度低于
+    /// [`LOW_SPEED_REFERENCE`] 时，侧向力叠加与速度反向的阻尼项，使车辆在
+    /// 静止与低速工况下具备侧向保持力；速度升高后该项平滑退出，侧向力回归
+    /// 侧偏刚度模型。
     pub fn impulse_forces(
         &self,
         motion: WheelMotion,
         slip_angle: f32,
+        lateral_speed: f32,
         normal_force: f32,
         dt: f32,
     ) -> TireForces {
@@ -95,8 +106,13 @@ impl TireModel {
         let impulse = motion.inertia * slip_speed / (motion.radius * motion.radius);
         let friction_longitudinal = (impulse / dt).clamp(-max_force, max_force);
 
-        // 2) 侧向力：侧偏刚度模型
-        let lateral = finite_or_zero(-self.lateral_stiffness * slip_angle);
+        // 2) 侧向力：侧偏刚度模型 + 低速速度阻尼
+        let lateral_slip = finite_or_zero(-self.lateral_stiffness * slip_angle);
+        let lateral_speed = finite_or_zero(lateral_speed);
+        let speed_ratio = (motion.ground_speed.abs() / LOW_SPEED_REFERENCE).min(1.0);
+        let low_speed_weight = (1.0 - speed_ratio) * (1.0 - speed_ratio);
+        let lateral_damping = self.lateral_stiffness / LOW_SPEED_REFERENCE;
+        let lateral = lateral_slip - lateral_damping * lateral_speed * low_speed_weight;
 
         // 3) 摩擦圆裁剪；车轮只承受摩擦力矩，滚动阻力由地面偏置法向力承担
         let (friction_longitudinal, lateral) =
@@ -202,7 +218,7 @@ mod tests {
 
     #[test]
     fn impulse_forces_are_zero_at_rest() {
-        let forces = model().impulse_forces(motion(0.0, 0.0), 0.0, 500.0, 0.01);
+        let forces = model().impulse_forces(motion(0.0, 0.0), 0.0, 0.0, 500.0, 0.01);
         assert_eq!(forces.longitudinal, 0.0);
         assert_eq!(forces.lateral, 0.0);
         assert_eq!(forces.wheel_torque, 0.0);
@@ -211,7 +227,7 @@ mod tests {
     #[test]
     fn impulse_forces_saturate_at_friction_circle() {
         // J=1, R=0.5, ω=10 → 冲量 20 N·s，dt=0.01 → 2000 N；μF_N=500 → 裁剪到 500。
-        let forces = model().impulse_forces(motion(10.0, 0.0), 0.0, 500.0, 0.01);
+        let forces = model().impulse_forces(motion(10.0, 0.0), 0.0, 0.0, 500.0, 0.01);
         assert!((forces.longitudinal - 500.0).abs() < 1e-3);
         assert!((forces.wheel_torque + 250.0).abs() < 1e-3);
     }
@@ -219,28 +235,53 @@ mod tests {
     #[test]
     fn impulse_forces_are_linear_below_limit() {
         // J=1, R=0.5, ω=0, v=1 → 冲量 -4 N·s，dt=0.01 → -400 N；上限 1000 不裁剪。
-        let forces = model().impulse_forces(motion(0.0, 1.0), 0.0, 1_000.0, 0.01);
+        let forces = model().impulse_forces(motion(0.0, 1.0), 0.0, 0.0, 1_000.0, 0.01);
         assert!((forces.longitudinal + 400.0).abs() < 1e-3);
         assert!((forces.wheel_torque - 200.0).abs() < 1e-3);
     }
 
     #[test]
     fn impulse_forces_combine_with_lateral_clip() {
-        let forces = model().impulse_forces(motion(10.0, 0.0), 1.0, 500.0, 0.01);
+        let forces = model().impulse_forces(motion(10.0, 0.0), 1.0, 0.0, 500.0, 0.01);
         let magnitude = forces.longitudinal.hypot(forces.lateral);
         assert!((magnitude - 500.0).abs() < 1e-3);
     }
 
     #[test]
     fn negative_normal_force_yields_no_force() {
-        let forces = model().impulse_forces(motion(10.0, 0.0), 0.5, -10.0, 0.01);
+        let forces = model().impulse_forces(motion(10.0, 0.0), 0.5, 0.0, -10.0, 0.01);
         assert_eq!(forces, TireForces::default());
     }
 
     #[test]
     fn non_finite_slip_angle_yields_no_force() {
-        let forces = model().impulse_forces(motion(10.0, 0.0), f32::NAN, 500.0, 0.01);
+        let forces = model().impulse_forces(motion(10.0, 0.0), f32::NAN, 0.0, 500.0, 0.01);
         assert_eq!(forces, TireForces::default());
+    }
+
+    #[test]
+    fn static_lateral_damping_holds_at_rest() {
+        // 静止时侧偏角为零，速度阻尼提供侧向保持：Cα/v_ref = 100 N/(m/s)。
+        let forces = model().impulse_forces(motion(0.0, 0.0), 0.0, 1.0, 1_000.0, 0.01);
+        assert!((forces.lateral + 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn static_lateral_damping_fades_with_ground_speed() {
+        let forces = model().impulse_forces(motion(0.0, 5.0), 0.0, 1.0, 1_000.0, 0.01);
+        assert_eq!(forces.lateral, 0.0);
+    }
+
+    #[test]
+    fn static_lateral_damping_is_clipped_by_friction_circle() {
+        let forces = model().impulse_forces(motion(0.0, 0.0), 0.0, 10.0, 100.0, 0.01);
+        assert!((forces.lateral + 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn non_finite_lateral_speed_yields_zero_damping() {
+        let forces = model().impulse_forces(motion(0.0, 0.0), 0.0, f32::NAN, 1_000.0, 0.01);
+        assert_eq!(forces.lateral, 0.0);
     }
 
     #[test]
@@ -251,8 +292,9 @@ mod tests {
             ..model()
         };
         // ω=0、v=10、J=1、R=0.5、dt=0.01 → 原始纵向力 -4000 N，摩擦圆饱和。
-        let reference = model.impulse_forces(motion(0.0, 10.0), 0.0, 1_000.0, 0.01).longitudinal;
-        let high = model.impulse_forces(motion(0.0, 10.0), 0.0, 4_000.0, 0.01).longitudinal;
+        let reference =
+            model.impulse_forces(motion(0.0, 10.0), 0.0, 0.0, 1_000.0, 0.01).longitudinal;
+        let high = model.impulse_forces(motion(0.0, 10.0), 0.0, 0.0, 4_000.0, 0.01).longitudinal;
 
         assert!((reference + 1_000.0).abs() < 1e-2);
         let expected = -4_000.0 * 4.0f32.powf(-0.1);
@@ -268,7 +310,7 @@ mod tests {
             ..model()
         };
 
-        let forces = model.impulse_forces(motion(0.0, 10.0), 0.0, 2_000.0, 0.01);
+        let forces = model.impulse_forces(motion(0.0, 10.0), 0.0, 0.0, 2_000.0, 0.01);
         assert!((forces.longitudinal + 2_000.0).abs() < 1e-3);
     }
 
@@ -279,11 +321,11 @@ mod tests {
             ..model()
         };
         // 自由滚动：ωR = v = 5 m/s，纵向摩擦力为零，仅剩滚动阻力。
-        let forward = model.impulse_forces(motion(10.0, 5.0), 0.0, 1_000.0, 0.01);
+        let forward = model.impulse_forces(motion(10.0, 5.0), 0.0, 0.0, 1_000.0, 0.01);
         assert!((forward.longitudinal + 20.0).abs() < 1e-3);
         assert_eq!(forward.wheel_torque, 0.0);
 
-        let backward = model.impulse_forces(motion(-10.0, -5.0), 0.0, 1_000.0, 0.01);
+        let backward = model.impulse_forces(motion(-10.0, -5.0), 0.0, 0.0, 1_000.0, 0.01);
         assert!((backward.longitudinal - 20.0).abs() < 1e-3);
         assert_eq!(backward.wheel_torque, 0.0);
     }
@@ -292,19 +334,22 @@ mod tests {
     fn rolling_resistance_is_zero_when_stationary_or_disabled() {
         let mut tire = model();
         tire.rolling_resistance = 0.02;
-        let stationary = tire.impulse_forces(motion(0.0, 0.0), 0.0, 1_000.0, 0.01);
+        let stationary = tire.impulse_forces(motion(0.0, 0.0), 0.0, 0.0, 1_000.0, 0.01);
         assert_eq!(stationary.longitudinal, 0.0);
 
         tire.rolling_resistance = 0.0;
-        let rolling = tire.impulse_forces(motion(10.0, 5.0), 0.0, 1_000.0, 0.01);
+        let rolling = tire.impulse_forces(motion(10.0, 5.0), 0.0, 0.0, 1_000.0, 0.01);
         assert_eq!(rolling.longitudinal, 0.0);
     }
 
     #[test]
     fn impulse_forces_reject_invalid_step_or_geometry() {
         let model = model();
-        assert_eq!(model.impulse_forces(motion(10.0, 0.0), 0.0, 500.0, 0.0).longitudinal, 0.0);
-        assert_eq!(model.impulse_forces(motion(10.0, 0.0), 0.0, 500.0, -0.01).longitudinal, 0.0);
+        assert_eq!(model.impulse_forces(motion(10.0, 0.0), 0.0, 0.0, 500.0, 0.0).longitudinal, 0.0);
+        assert_eq!(
+            model.impulse_forces(motion(10.0, 0.0), 0.0, 0.0, 500.0, -0.01).longitudinal,
+            0.0
+        );
 
         let no_radius = WheelMotion {
             angular_velocity: 10.0,
@@ -312,7 +357,7 @@ mod tests {
             radius: 0.0,
             inertia: 1.0,
         };
-        assert_eq!(model.impulse_forces(no_radius, 0.0, 500.0, 0.01).longitudinal, 0.0);
+        assert_eq!(model.impulse_forces(no_radius, 0.0, 0.0, 500.0, 0.01).longitudinal, 0.0);
 
         let no_inertia = WheelMotion {
             angular_velocity: 10.0,
@@ -320,6 +365,6 @@ mod tests {
             radius: 0.5,
             inertia: 0.0,
         };
-        assert_eq!(model.impulse_forces(no_inertia, 0.0, 500.0, 0.01).longitudinal, 0.0);
+        assert_eq!(model.impulse_forces(no_inertia, 0.0, 0.0, 500.0, 0.01).longitudinal, 0.0);
     }
 }

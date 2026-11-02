@@ -62,6 +62,31 @@ pub fn step(
     }
 }
 
+/// 查询端口所在的转速连通组折算到该端口的等效转动惯量（kg·m²）。
+///
+/// 该值包含传动链上所有刚性耦合部件的惯量，按固定传动比折算；端口不在任何
+/// 动力岛内、或所在连通组惯量为零时返回 `None`。宿主在显式轮胎力耦合中应使用
+/// 该值而不是单轮惯量，否则锁止轴与低挡位工况会低估车轮端的有效惯量。
+pub fn port_effective_inertia(
+    topology: &VehicleTopology,
+    compiled: &CompiledVehicle,
+    payloads: &PortPayloads,
+    port: PortId,
+) -> Option<f32> {
+    let island =
+        compiled.drivetrain_islands().iter().find(|island| island.ports().contains(&port))?;
+    let graph = build_rotation_graph(topology, island, payloads);
+    let (mut bodies, port_body) = build_bodies(island, &graph, payloads);
+    collect_inertia(topology, island, &port_body, &mut bodies);
+
+    let &(body_index, ratio) = port_body.get(&port)?;
+    if !ratio.is_finite() || ratio == 0.0 {
+        return None;
+    }
+    let inertia = bodies[body_index].inertia / (ratio * ratio);
+    (inertia.is_finite() && inertia > 0.0).then_some(inertia)
+}
+
 fn solve_island(
     topology: &VehicleTopology,
     island: &DrivetrainIsland,
@@ -491,7 +516,7 @@ fn is_rotational(topology: &VehicleTopology, port: PortId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::step;
+    use super::{port_effective_inertia, step};
     use crate::compiler::compile;
     use crate::payload::{PortPayload, PortPayloads};
     use crate::topology::VehicleTopology;
@@ -564,6 +589,29 @@ mod tests {
         };
         assert!((angular_velocity - 0.05).abs() < 1e-6);
         assert_eq!(torque, 0.0);
+    }
+
+    #[test]
+    fn effective_inertia_includes_coupled_rotors() {
+        let mut topology = VehicleTopology::new();
+        let driver = topology.add_node(Rotor {
+            inertia: 1.0,
+            torque: 0.0,
+        });
+        let load = topology.add_node(Rotor {
+            inertia: 3.0,
+            torque: 0.0,
+        });
+        let driver_port = topology.nodes()[driver].ports[0];
+        let load_port = topology.nodes()[load].ports[0];
+        topology.connect(driver_port, load_port).unwrap();
+
+        let mut payloads = PortPayloads::new();
+        payloads.rebuild(&topology);
+        let compiled = compile(&topology).unwrap();
+
+        let inertia = port_effective_inertia(&topology, &compiled, &payloads, load_port).unwrap();
+        assert!((inertia - 4.0).abs() < 1e-6);
     }
 
     #[test]
