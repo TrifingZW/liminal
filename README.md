@@ -7,6 +7,8 @@
 - 求解语义参照 Jolt Vehicles：轮胎与传动趋向冲量（**Impulse**）与约束（**Constraint**）语义，而不是把轮胎当作外力近似；
 - 职责边界参照 Chaos Vehicles：库不拥有刚体，空间域只产出关节与位姿描述，由宿主构建原生约束并积分。
 
+各条载具仿真路线的机制、构成与取舍对比，见[载具物理仿真路线研究报告](docs/vehicle-physics-routes.md)。
+
 宿主通过 C ABI 接入，须遵守[适配契约](docs/adapter-contract.md)。UE5 的 Cirrova 插件已接入 Chaos 并在工程内跑通；其它引擎的接入在计划中。
 
 ## 特性
