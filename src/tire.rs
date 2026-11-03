@@ -30,6 +30,17 @@ pub struct TireForces {
     pub wheel_torque: f32,
 }
 
+/// 约束式耦合所需的力界与外部力。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TireConstraint {
+    /// 载荷敏感后的摩擦圆上限（N），作为纵向与侧向冲量的共同界。
+    pub friction_force: f32,
+    /// 侧向力（N），正侧偏角产生负向力，已按摩擦圆裁剪。
+    pub lateral_force: f32,
+    /// 滚动阻力（N），逆向地面速度，不产生车轮反作用。
+    pub rolling_force: f32,
+}
+
 /// 车轮运动状态：轮胎冲量解的输入。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WheelMotion {
@@ -128,6 +139,37 @@ impl TireModel {
         }
     }
 
+    /// 约束式耦合：输出摩擦圆上限、侧向力与滚动阻力。
+    ///
+    /// 纵向不再给出力解：适配层以 [`TireConstraint::friction_force`] 作为两轴冲量界，
+    /// 由宿主求解器在速度迭代内完成目标速度对齐。
+    pub fn constraint_forces(
+        &self,
+        ground_speed: f32,
+        slip_angle: f32,
+        lateral_speed: f32,
+        normal_force: f32,
+    ) -> TireConstraint {
+        let max_force = self.friction_limit(normal_force);
+        if !ground_speed.is_finite() || !slip_angle.is_finite() || max_force <= 0.0 {
+            return TireConstraint::default();
+        }
+
+        let lateral_slip = finite_or_zero(-self.lateral_stiffness * slip_angle);
+        let lateral_speed = finite_or_zero(lateral_speed);
+        let speed_ratio = (ground_speed.abs() / LOW_SPEED_REFERENCE).min(1.0);
+        let low_speed_weight = (1.0 - speed_ratio) * (1.0 - speed_ratio);
+        let lateral_damping = self.lateral_stiffness / LOW_SPEED_REFERENCE;
+        let lateral = lateral_slip - lateral_damping * lateral_speed * low_speed_weight;
+        let (_, lateral) = clip_to_friction_circle(0.0, lateral, max_force);
+
+        TireConstraint {
+            friction_force: max_force,
+            lateral_force: lateral,
+            rolling_force: self.rolling_force(ground_speed, normal_force, max_force),
+        }
+    }
+
     /// 载荷敏感后的摩擦圆上限（N）。
     fn friction_limit(&self, normal_force: f32) -> f32 {
         let load = finite_or_zero(normal_force).max(0.0);
@@ -201,7 +243,7 @@ fn clip_to_friction_circle(longitudinal: f32, lateral: f32, max_force: f32) -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{TireForces, TireModel, WheelMotion};
+    use super::{TireConstraint, TireForces, TireModel, WheelMotion};
 
     fn model() -> TireModel {
         TireModel::new(1.0, 100.0)
@@ -300,6 +342,22 @@ mod tests {
         let expected = -4_000.0 * 4.0f32.powf(-0.1);
         assert!((high - expected).abs() < 1e-1);
         assert!(high > -4_000.0);
+    }
+
+    #[test]
+    fn constraint_forces_expose_friction_bound_and_lateral_sign() {
+        let model = model();
+        let constraint = model.constraint_forces(0.0, 0.1, 0.0, 500.0);
+        assert!((constraint.friction_force - 500.0).abs() < 1e-3);
+        assert!((constraint.lateral_force + 10.0).abs() < 1e-3);
+        assert_eq!(constraint.rolling_force, 0.0);
+    }
+
+    #[test]
+    fn constraint_forces_reject_invalid_input() {
+        let model = model();
+        assert_eq!(model.constraint_forces(f32::NAN, 0.0, 0.0, 500.0), TireConstraint::default());
+        assert_eq!(model.constraint_forces(0.0, 0.0, 0.0, -1.0), TireConstraint::default());
     }
 
     #[test]

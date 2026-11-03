@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 use crate::payload::PortPayload;
 use crate::simulator::Simulator;
 use crate::spatial::{Frame, SpatialJointDesc};
-use crate::tire::{TireForces, TireModel, WheelMotion};
+use crate::tire::{TireConstraint, TireForces, TireModel, WheelMotion};
 use crate::topology::VehicleTopology;
 use crate::types::{ConnectError, EdgeId, NodeId, PortId};
 use crate::units::rotational::{
@@ -52,6 +52,25 @@ impl From<TireForces> for LiminalTireForces {
             longitudinal: forces.longitudinal,
             lateral: forces.lateral,
             wheel_torque: forces.wheel_torque,
+        }
+    }
+}
+
+/// 约束式轮胎耦合的力界与外部力。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiminalTireConstraint {
+    pub friction_force: f32,
+    pub lateral_force: f32,
+    pub rolling_force: f32,
+}
+
+impl From<TireConstraint> for LiminalTireConstraint {
+    fn from(constraint: TireConstraint) -> Self {
+        Self {
+            friction_force: constraint.friction_force,
+            lateral_force: constraint.lateral_force,
+            rolling_force: constraint.rolling_force,
         }
     }
 }
@@ -205,7 +224,7 @@ pub struct LiminalSignalOp {
 }
 
 /// C ABI 版本：布局或语义发生不兼容变更时递增。
-pub const LIMINAL_ABI_VERSION: u32 = 1;
+pub const LIMINAL_ABI_VERSION: u32 = 2;
 
 /// 返回 C ABI 版本，供宿主在初始化时校验头文件与静态库是否匹配。
 #[unsafe(no_mangle)]
@@ -946,6 +965,26 @@ pub unsafe extern "C" fn liminal_tire_impulse_forces(
             normal_force,
             dt,
         )
+        .into()
+}
+
+/// 约束式轮胎耦合：输出载荷敏感摩擦上限、侧向力与滚动阻力（N）。
+///
+/// 适配层以 `friction_force` 作为纵向与侧向冲量的共同界，由宿主求解器在速度
+/// 迭代内完成目标速度对齐；侧向力用于限定侧向冲量，滚动阻力作为外部力施加。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liminal_tire_constraint(
+    model: *const LiminalTireModel,
+    ground_speed: f32,
+    slip_angle: f32,
+    lateral_speed: f32,
+    normal_force: f32,
+) -> LiminalTireConstraint {
+    let Some(model) = (unsafe { model.as_ref() }) else {
+        return LiminalTireConstraint::default();
+    };
+    TireModel::from(*model)
+        .constraint_forces(ground_speed, slip_angle, lateral_speed, normal_force)
         .into()
 }
 
