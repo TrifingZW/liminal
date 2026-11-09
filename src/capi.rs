@@ -56,11 +56,14 @@ impl From<TireForces> for LiminalTireForces {
     }
 }
 
-/// 约束式轮胎耦合的力界与外部力。
+/// 约束式轮胎耦合的摩擦椭圆界与外部力。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiminalTireConstraint {
-    pub friction_force: f32,
+    pub longitudinal_limit: f32,
+    pub lateral_limit: f32,
+    pub static_longitudinal_limit: f32,
+    pub static_lateral_limit: f32,
     pub lateral_force: f32,
     pub rolling_force: f32,
 }
@@ -68,7 +71,10 @@ pub struct LiminalTireConstraint {
 impl From<TireConstraint> for LiminalTireConstraint {
     fn from(constraint: TireConstraint) -> Self {
         Self {
-            friction_force: constraint.friction_force,
+            longitudinal_limit: constraint.longitudinal_limit,
+            lateral_limit: constraint.lateral_limit,
+            static_longitudinal_limit: constraint.static_longitudinal_limit,
+            static_lateral_limit: constraint.static_lateral_limit,
             lateral_force: constraint.lateral_force,
             rolling_force: constraint.rolling_force,
         }
@@ -80,20 +86,24 @@ impl From<TireConstraint> for LiminalTireConstraint {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiminalTireModel {
     pub friction_coefficient: f32,
+    pub lateral_friction_coefficient: f32,
     pub lateral_stiffness: f32,
     pub load_sensitivity: f32,
     pub reference_load: f32,
     pub rolling_resistance: f32,
+    pub static_friction_scale: f32,
 }
 
 impl From<LiminalTireModel> for TireModel {
     fn from(params: LiminalTireModel) -> Self {
         Self {
             friction_coefficient: params.friction_coefficient,
+            lateral_friction_coefficient: params.lateral_friction_coefficient,
             lateral_stiffness: params.lateral_stiffness,
             load_sensitivity: params.load_sensitivity,
             reference_load: params.reference_load,
             rolling_resistance: params.rolling_resistance,
+            static_friction_scale: params.static_friction_scale,
         }
     }
 }
@@ -224,7 +234,7 @@ pub struct LiminalSignalOp {
 }
 
 /// C ABI 版本：布局或语义发生不兼容变更时递增。
-pub const LIMINAL_ABI_VERSION: u32 = 2;
+pub const LIMINAL_ABI_VERSION: u32 = 3;
 
 /// 返回 C ABI 版本，供宿主在初始化时校验头文件与静态库是否匹配。
 #[unsafe(no_mangle)]
@@ -934,7 +944,7 @@ pub unsafe extern "C" fn liminal_vehicle_spatial_link(
 }
 
 /// 轮胎冲量解：纵向按本步内对齐轮面与地面速度所需冲量折算，
-/// 侧向按侧偏刚度，合力按摩擦圆裁剪，并叠加滚动阻力。
+/// 侧向按侧偏刚度，合力按摩擦椭圆裁剪，并叠加滚动阻力。
 ///
 /// `wheel_torque` 仅含摩擦力矩，滚动阻力不产生车轮反作用。
 #[unsafe(no_mangle)]
@@ -968,10 +978,10 @@ pub unsafe extern "C" fn liminal_tire_impulse_forces(
         .into()
 }
 
-/// 约束式轮胎耦合：输出载荷敏感摩擦上限、侧向力与滚动阻力（N）。
+/// 约束式轮胎耦合：输出摩擦椭圆四轴界、侧向力与滚动阻力（N）。
 ///
-/// 适配层以 `friction_force` 作为纵向与侧向冲量的共同界，由宿主求解器在速度
-/// 迭代内完成目标速度对齐；侧向力用于限定侧向冲量，滚动阻力作为外部力施加。
+/// 适配层以动/静摩擦界构造联合椭圆，由宿主求解器在速度迭代内完成目标速度
+/// 对齐；侧向力用于遥测与外力回退，滚动阻力作为外部力施加。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liminal_tire_constraint(
     model: *const LiminalTireModel,
@@ -1249,10 +1259,12 @@ mod tests {
     fn tire_helper_applies_load_sensitivity_and_rolling_resistance() {
         let model = LiminalTireModel {
             friction_coefficient: 1.0,
+            lateral_friction_coefficient: 1.0,
             lateral_stiffness: 0.0,
             load_sensitivity: 0.1,
             reference_load: 1_000.0,
             rolling_resistance: 0.02,
+            static_friction_scale: 1.0,
         };
         // 自由滚动（ωR = v）：纵向摩擦力为零，仅剩滚动阻力。
         let forces = unsafe {
