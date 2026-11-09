@@ -172,6 +172,7 @@ cargo run               # 四轮动力链演示
   原生悬挂法向载荷由 `NetPushOut` 还原，而不是 `k·compression`（旧算法会低报约 15%）
 - Cirrova P0 自动化场景 T0–T10 共 11 项全部通过；运行方式与基线见
   `Plugins/Cirrova/Docs/P0-validation.md`，后续路线见 `Plugins/Cirrova/Docs/roadmap.md`
+- Cirrova 适配层已将轮端 `J_eff` 消元进纵向轮胎约束（`R²/J_eff`）：自由驱动/滑行时轮端参与冲量分配，制动锁止时退化为纯底盘约束（P1.1）；制动扭矩显式进入轮端 DOF 留待 P1.4
 - 轮端等效惯量由 `liminal_vehicle_effective_inertia` 查询，包含传动链折算惯量；显式轮胎力耦合应使用该值
 - 空间域存在环时编译失败（`CompileError::SpatialCycle`）；空间连接未连接到根节点时
   编译失败（`CompileError::SpatialDisconnected`），不再静默忽略
